@@ -70,7 +70,7 @@ class EarlyStopping:
             self.save_checkpoint(score, model)
         elif self.compare(score):
             self.counter += 1
-            print(f'EarlyStopping counter: {self.counter} out of {self.patience}')
+            tqdm.write(f'EarlyStopping counter: {self.counter} out of {self.patience}')
             if self.counter >= self.patience:
                 self.early_stop = True
         else:
@@ -81,7 +81,7 @@ class EarlyStopping:
     def save_checkpoint(self, score, model):
         '''Saves model when validation loss decrease.'''
         if self.verbose:
-            print(f'Validation score increased.  Saving model ...')
+            tqdm.write('Validation score increased.  Saving model ...')
         torch.save(model.state_dict(), self.checkpoint_path)
         self.score_min = score
 
@@ -682,7 +682,7 @@ def generate_global_adj_matrix(new_Item, num_items):
 
     # Simple normalization
     rowsum = np.array(adj.sum(1)).astype(float)
-    d_inv = np.power(rowsum, -1).flatten()
+    d_inv = np.power(1.0, rowsum, where=rowsum!=0, out=np.zeros_like(rowsum)).flatten()
     d_inv[np.isinf(d_inv)] = 0.
     d_mat_inv = csr_matrix((d_inv, (np.arange(num_items), np.arange(num_items))), shape=(num_items, num_items))
     norm_adj = d_mat_inv.dot(adj)

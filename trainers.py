@@ -69,7 +69,7 @@ class Trainer:
             "HIT@10": '{:.4f}'.format(HIT_10), "NDCG@10": '{:.4f}'.format(NDCG_10),
             "MRR": '{:.4f}'.format(MRR),
         }
-        print(post_fix, flush=True)
+        tqdm.tqdm.write(str(post_fix))
         with open(self.args.log_file, 'a') as f:
             f.write(str(post_fix) + '\n')
         return [HIT_1, NDCG_1, HIT_5, NDCG_5, HIT_10, NDCG_10, MRR], str(post_fix), None
@@ -96,7 +96,7 @@ class Trainer:
             "HIT@40": '{:.8f}'.format(recall[5]), "NDCG@40": '{:.8f}'.format(ndcg[5]),
             "MRR": '{:.8f}'.format(mrr)
         }
-        print(post_fix, flush=True)
+        tqdm.tqdm.write(str(post_fix))
         with open(self.args.log_file, 'a') as f:
             f.write(str(post_fix) + '\n')
         return [recall[0], ndcg[0], recall[1], ndcg[1], recall[2], ndcg[2], recall[3], ndcg[3], recall[4], ndcg[4], recall[5], ndcg[5], mrr], str(post_fix), [recall_dict_list, ndcg_dict_list, mrr_dict]
@@ -219,8 +219,8 @@ class PretrainTrainer(Trainer):
             "map_loss_avg": '{:.4f}'.format(map_loss_avg / num),
             "sp_loss_avg": '{:.4f}'.format(sp_loss_avg / num),
         }
-        print(desc)
-        print(str(post_fix))
+        tqdm.tqdm.write(desc)
+        tqdm.tqdm.write(str(post_fix))
         with open(self.args.log_file, 'a') as f:
             f.write(str(desc) + '\n')
             f.write(str(post_fix) + '\n')
@@ -282,7 +282,7 @@ class FinetuneTrainer(Trainer):
                 rating_pred = self.predict_full(recommend_output)
 
                 rating_pred = rating_pred.cpu().data.numpy().copy()
-                batch_user_index = user_ids.cpu().numpy()
+                batch_user_index = user_ids.cpu().numpy().tolist()
                 rating_pred[self.args.train_matrix[batch_user_index].toarray() > 0] = 0
 
                 batch_pred_list = np.argsort(-rating_pred, axis=1)
@@ -352,7 +352,7 @@ class FinetuneTrainer(Trainer):
             }
 
             if (epoch + 1) % self.args.log_freq == 0:
-                print(str(post_fix), flush=True)
+                tqdm.tqdm.write(str(post_fix))
 
             with open(self.args.log_file, 'a') as f:
                 f.write(str(post_fix) + '\n')
@@ -377,7 +377,7 @@ class FinetuneTrainer(Trainer):
                     rating_pred = self.predict_full(recommend_output)
 
                     rating_pred = rating_pred.cpu().data.numpy().copy()
-                    batch_user_index = user_ids.cpu().numpy()
+                    batch_user_index = user_ids.cpu().numpy().tolist()
                     rating_pred[self.args.train_matrix[batch_user_index].toarray() > 0] = 0
                     # reference: https://stackoverflow.com/a/23734295, https://stackoverflow.com/a/20104162
                     ind = np.argpartition(rating_pred, -40)[:, -40:]
@@ -631,7 +631,7 @@ class DistSAModelTrainer(Trainer):
             }
 
             if (epoch + 1) % self.args.log_freq == 0:
-                print(str(post_fix), flush=True)
+                tqdm.tqdm.write(str(post_fix))
 
             with open(self.args.log_file, 'a') as f:
                 f.write(str(post_fix) + '\n')
@@ -660,7 +660,7 @@ class DistSAModelTrainer(Trainer):
                             rating_pred = self.dist_predict_full(recommend_mean_output, recommend_cov_output)
 
                         rating_pred = rating_pred.cpu().data.numpy().copy()
-                        batch_user_index = user_ids.cpu().numpy()
+                        batch_user_index = user_ids.cpu().numpy().tolist()
                         rating_pred[self.args.train_matrix[batch_user_index].toarray() > 0] = 1e+24
                         ind = np.argpartition(rating_pred, 40)[:, :40]
                         arr_ind = rating_pred[np.arange(len(rating_pred))[:, None], ind]
@@ -724,7 +724,7 @@ class DistSAModelTrainer(Trainer):
                     rating_pred = self.dist_predict_full(recommend_mean_output, recommend_cov_output)
                 
                 rating_pred = rating_pred.cpu().data.numpy().copy()
-                batch_user_index = user_ids.cpu().numpy()
+                batch_user_index = user_ids.cpu().numpy().tolist()
                 rating_pred[self.args.train_matrix[batch_user_index].toarray() > 0] = 1e+24
 
                 batch_pred_list = np.argsort(rating_pred, axis=1)
@@ -903,7 +903,7 @@ class RelationAwareSASRecModelTrainer(Trainer):
 
                 rating_pred = self.predict_full(recommend_output)
                 rating_pred = rating_pred.cpu().data.numpy().copy()
-                batch_user_index = user_ids.cpu().numpy()
+                batch_user_index = user_ids.cpu().numpy().tolist()
                 rating_pred[self.args.train_matrix[batch_user_index].toarray() > 0] = 0
 
                 batch_pred_list = np.argsort(-rating_pred, axis=1)
@@ -986,7 +986,7 @@ class RelationAwareSASRecModelTrainer(Trainer):
             }
 
             if (epoch + 1) % self.args.log_freq == 0:
-                print(str(post_fix), flush=True)
+                tqdm.tqdm.write(str(post_fix))
 
             with open(self.args.log_file, 'a') as f:
                 f.write(str(post_fix) + '\n')
@@ -1012,7 +1012,7 @@ class RelationAwareSASRecModelTrainer(Trainer):
                     rating_pred = self.relation_predict_full(recommend_output)
 
                     rating_pred = rating_pred.cpu().data.numpy().copy()
-                    batch_user_index = user_ids.cpu().numpy()
+                    batch_user_index = user_ids.cpu().numpy().tolist()
                     rating_pred[self.args.train_matrix[batch_user_index].toarray() > 0] = 0
                     ind = np.argpartition(rating_pred, -40)[:, -40:]
                     arr_ind = rating_pred[np.arange(len(rating_pred))[:, None], ind]

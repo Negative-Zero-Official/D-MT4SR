@@ -1,11 +1,10 @@
 # -*- coding: utf-8 -*-
-# @Time    : 2020/4/25 22:59
 
 import os
 import numpy as np
-import random
 import torch
 import argparse
+from tqdm import tqdm
 
 from torch.utils.data import DataLoader, RandomSampler, SequentialSampler
 
@@ -175,13 +174,21 @@ def main():
         #    print(f'{pretrained_path} Not Found! The Model is same as SASRec')
 
         early_stopping = EarlyStopping(args.checkpoint_path, patience=50, verbose=True)
-        for epoch in range(args.epochs):
+
+        epoch_iter = tqdm(
+            range(args.epochs),
+            desc="Training",
+            unit="epoch",
+            leave=True
+        )
+
+        for epoch in epoch_iter:
             trainer.train(epoch)
             # evaluate on MRR
             scores, _, _ = trainer.valid(epoch, full_sort=True)
             early_stopping(np.array(scores[-1:]), trainer.model)
             if early_stopping.early_stop:
-                print("Early stopping")
+                tqdm.write("Early stopping")
                 break
 
         print('---------------Change to test_rating_matrix!-------------------')
