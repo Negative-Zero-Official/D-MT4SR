@@ -149,7 +149,7 @@ def get_user_seqs(data_file):
     return user_seq, max_item, valid_rating_matrix, test_rating_matrix, num_users
 
 def get_user_seqs_MoHRdata(dataset):
-    dataset = np.load('../data/'+dataset+'Partitioned_5core.npy', allow_pickle=True)
+    dataset = np.load('data\\'+dataset+'Partitioned_5core.npy', allow_pickle=True)
     [user_train, user_validation, user_test, Item, Item_relationship_mask_mat_completeseqs, relationships_ind, usernum, itemnum] = dataset
 
     user_seq = []
@@ -180,9 +180,12 @@ def get_user_seqs_MoHRdata(dataset):
             new_related_dict[rel_ind] = reindex_rel_i_list
         new_Item[reindex_item] = new_related_dict
 
+    # NEW: Generate global adjacency matrix using the reindexed new_Item
+    adj_matrix = generate_global_adj_matrix(new_Item, num_items)
+
     valid_rating_matrix = generate_rating_matrix_valid(user_seq, num_users, num_items)
     test_rating_matrix = generate_rating_matrix_test(user_seq, num_users, num_items)
-    return user_seq, max_item, valid_rating_matrix, test_rating_matrix, num_users, user_seq_mask_mat_rel, relationships_ind, new_Item
+    return user_seq, max_item, valid_rating_matrix, test_rating_matrix, num_users, user_seq_mask_mat_rel, relationships_ind, new_Item, adj_matrix
 
 def get_user_seqs_long(data_file):
     lines = open(data_file).readlines()
@@ -294,7 +297,7 @@ def cal_mrr(actual, predicted):
         r = np.array(r)
         if np.sum(r) > 0:
             #sum_mrr += np.reciprocal(np.where(r==1)[0]+1, dtype=np.float)[0]
-            one_user_mrr = np.reciprocal(np.where(r==1)[0]+1, dtype=np.float)[0]
+            one_user_mrr = np.reciprocal(np.where(r==1)[0]+1, dtype=np.float64)[0]
             sum_mrr += one_user_mrr
             true_users += 1
             mrr_dict[i] = one_user_mrr
@@ -649,3 +652,52 @@ def get_item_performance_perpopularity(items_in_freqintervals, all_pos_items_ran
         for k_ind in range(len(Ks)):
             k = Ks[k_ind]
             print('Recall@%d:%.6f, NDCG@%d:%.6f'%(k, interval_results[i]['recall'][k_ind], k, interval_results[i]['ndcg'][k_ind]))
+
+
+
+# ================== D-MT4SR IMPROVEMENTS (Note: some changes to previous functions) =========================================================
+
+def generate_global_adj_matrix(new_Item, num_items):
+    """
+    Constructs a normalized sparse adjacency matrix from the Item relationships
+    """
+    row = []
+    col = []
+    data = []
+
+    for item_i, related_dict in new_Item.items():
+        for rel_type, related_items in related_dict.items():
+            for item_j in related_items:
+                # Add edge i -> j
+                row.append(item_i)
+                col.append(item_j)
+                data.append(1)
+
+                # Treat relationships as undirected
+                row.append(item_j)
+                col.append(item_i)
+                data.append(1)
+    
+    adj = csr_matrix((data, (row, col)), shape=(num_items, num_items))
+
+    # Simple normalization
+    rowsum = np.array(adj.sum(1)).astype(float)
+    d_inv = np.power(rowsum, -1).flatten()
+    d_inv[np.isinf(d_inv)] = 0.
+    d_mat_inv = csr_matrix((d_inv, (np.arange(num_items), np.arange(num_items))), shape=(num_items, num_items))
+    norm_adj = d_mat_inv.dot(adj)
+
+    return norm_adj
+
+def scipy_to_torch_sparse(sparse_mx):
+    """
+    Converts a scipy sparse matrix to a torch sparse tensor
+    """
+    sparse_mx = sparse_mx.tocoo().astype(np.float32)
+    indices = torch.from_numpy(
+        np.vstack((sparse_mx.row, sparse_mx.col)).astype(np.int64)
+    )
+    values = torch.from_numpy(sparse_mx.data)
+    shape = torch.Size(sparse_mx.shape)
+
+    return torch.sparse_coo_tensor(indices, values, shape)

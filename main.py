@@ -11,14 +11,13 @@ from torch.utils.data import DataLoader, RandomSampler, SequentialSampler
 
 from datasets import SASRecDataset, RelationAwareSASRecDataset
 from trainers import FinetuneTrainer, DistSAModelTrainer, RelationAwareSASRecModelTrainer
-from models import S3RecModel
-from seqmodels import SASRecModel, DistSAModel, DistMeanSAModel, RelationAwareSASRecModel
-from utils import EarlyStopping, get_user_seqs, get_item2attribute_json, check_path, set_seed, get_user_seqs_MoHRdata
+from seqmodels import SASRecModel, DistSAModel, DistMeanSAModel, RelationAwareSASRecModel, GNNRelationAwareSASRecModel
+from utils import EarlyStopping, get_user_seqs, get_item2attribute_json, check_path, set_seed, get_user_seqs_MoHRdata, scipy_to_torch_sparse
 
 def main():
     parser = argparse.ArgumentParser()
 
-    parser.add_argument('--data_dir', default='../data/', type=str)
+    parser.add_argument('--data_dir', default='data/', type=str)
     parser.add_argument('--output_dir', default='output/', type=str)
     parser.add_argument('--data_name', default='Beauty', type=str)
     parser.add_argument('--do_eval', action='store_true')
@@ -52,6 +51,9 @@ def main():
     parser.add_argument("--adam_beta2", type=float, default=0.999, help="adam second beta value")
     parser.add_argument("--gpu_id", type=str, default="0", help="gpu_id")
 
+    # D-MT4SR new args
+    parser.add_argument("--num_gnn_layers", type=int, default=2, help="number of GNN layers")
+
     args = parser.parse_args()
 
     set_seed(args.seed)
@@ -66,8 +68,10 @@ def main():
 
     #user_seq, max_item, valid_rating_matrix, test_rating_matrix, num_users = \
     #    get_user_seqs(args.data_file)
-    user_seq, max_item, valid_rating_matrix, test_rating_matrix, num_users, user_seq_mask_mat_rel, relationships_ind_map, Item = \
+    user_seq, max_item, valid_rating_matrix, test_rating_matrix, num_users, user_seq_mask_mat_rel, relationships_ind_map, Item, adj_matrix = \
             get_user_seqs_MoHRdata(args.data_name)
+    
+    adj_matrix = scipy_to_torch_sparse(adj_matrix)
 
     #item2attribute, attribute_size = get_item2attribute_json(item2attribute_file)
 
@@ -133,6 +137,18 @@ def main():
         test_dataloader = DataLoader(test_dataset, sampler=test_sampler, batch_size=args.batch_size)
         trainer = RelationAwareSASRecModelTrainer(model, train_dataloader, eval_dataloader,
                                     test_dataloader, args)
+
+
+    # ================== D-MT4SR IMPROVEMENTS (Note: some changes to previous functions) =========================================================
+
+    elif args.model_name == 'GNNRelationAwareSASRecModel':
+        model = GNNRelationAwareSASRecModel(args, adj_matrix)
+        eval_dataloader = DataLoader(eval_dataset, sampler=eval_sampler, batch_size=args.batch_size)
+        test_dataloader = DataLoader(test_dataset, sampler=test_sampler, batch_size=args.batch_size)
+        trainer = FinetuneTrainer(model, train_dataloader, eval_dataloader,
+                                test_dataloader, args)
+
+
     else:
         model = SASRecModel(args=args)
         eval_dataloader = DataLoader(eval_dataset, sampler=eval_sampler, batch_size=args.batch_size)

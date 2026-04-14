@@ -624,3 +624,35 @@ class Encoder(nn.Module):
         if not output_all_encoded_layers:
             all_encoder_layers.append(hidden_states)
         return all_encoder_layers
+
+
+
+# ================== D-MT4SR IMPROVEMENTS (Note: some changes to previous functions) =========================================================
+
+class SemanticGNNEncoder(nn.Module):
+    """
+    Refines item embeddings by aggregating information from semantic neighbors.
+    Uses LightGCN-style linear message passing for efficiency.
+    """
+    def __init__(self, args, adj_matrix):
+        super(SemanticGNNEncoder, self).__init__()
+        self.adj_matrix = adj_matrix
+        self.num_layers = args.num_gnn_layers if hasattr(args, 'num_gnn_layers') else 2
+    
+    def forward(self, item_embeddings):
+        """
+        item_embeddings: Inital embedding table (E^0) of shape [num_items, hidden_size]
+        """
+        all_embeddings = [item_embeddings]
+        current_emb = item_embeddings
+
+        for _ in range(self.num_layers):
+            # Code GNN operation: E^(l+1) = Adjacency * E^(l)
+            # This mixes the features of related items globally
+            current_emb = torch.sparse.mm(self.adj_matrix, current_emb)
+            all_embeddings.append(current_emb)
+        
+        # Final representation is the average across all hops
+        # This captures both immediate (1-hop) and transitive (multi-hop) relations
+        final_embeddings = torch.stack(all_embeddings, dim=1).mean(dim=1)
+        return final_embeddings

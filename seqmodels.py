@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
-from modules import Encoder, LayerNorm, DistSAEncoder, DistMeanSAEncoder, RelationAwareSAEncoder
+import torch.nn.functional as F
+from modules import Encoder, LayerNorm, DistSAEncoder, DistMeanSAEncoder, RelationAwareSAEncoder, SemanticGNNEncoder
 
 class SASRecModel(nn.Module):
     def __init__(self, args):
@@ -204,3 +205,67 @@ class RelationAwareSASRecModel(SASRecModel):
 
         sequence_output = item_encoded_layers[-1]
         return sequence_output, sequence_emb, relation_embs_layers, relation_weights_layers
+
+
+
+# ================== D-MT4SR IMPROVEMENTS (Note: some changes to previous functions) =========================================================
+
+"""
+MODEL FOR ABLATION (Compare against Baseline)
+"""
+class GNNRelationAwareSASRecModel(SASRecModel):
+    """
+    Extension of SASRec that uses a Global GNN to refine item representations based on semantic relationships
+    """
+    def __init__(self, args, adj_matrix):
+        super(GNNRelationAwareSASRecModel, self).__init__(args)
+        # Store the GNN Encoder
+        self.gnn_encoder = SemanticGNNEncoder(args, adj_matrix)
+
+        # Ensure adjacency matrix moves to the correct device
+        if args.cuda_condition:
+            self.gnn_encoder.adj_matrix = self.gnn_encoder.adj_matrix.cuda()
+    
+    def finetune(self, input_ids):
+        # Global GNN Refinement
+        # Pass the entire embedding table through the GNN
+        all_item_embeddings = self.item_embeddings.weight # [num_items, d]
+        refined_item_table = self.gnn_encoder(all_item_embeddings) # [num_items, d]
+
+        # Standard SASRec Processing
+        # Instead of using self.item_embeddings(input_ids), index the refined table
+        # Use F.embedding for efficiency on the refined table
+        attention_mask = (input_ids > 0).long()
+        extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
+        max_len = attention_mask.size(-1)
+        attn_shape = (1, max_len, max_len)
+        subsequent_mask = torch.triu(torch.ones(attn_shape), diagonal=1)
+        subsequent_mask = (subsequent_mask == 0).unsqueeze(1).long()
+
+        if self.args.cuda_condition:
+            subsequent_mask = subsequent_mask.cuda()
+        
+        extended_attention_mask = extended_attention_mask * subsequent_mask
+        extended_attention_mask = extended_attention_mask.to(dtype=next(self.parameters()).dtype)
+        extended_attention_mask = (1.0 - extended_attention_mask) * -10000.0
+
+        # Create the sequence embeddings using the refined GNN table
+        item_embeddings = F.embedding(input_ids, refined_item_table)
+
+        # Add positions (standard Transformer logic)
+        seq_length = input_ids.size(1)
+        position_ids = torch.arange(seq_length, dtype=torch.long, device=input_ids.device)
+        position_ids = position_ids.unsqueeze(0).expand_as(input_ids)
+        position_embeddings = self.position_embeddings(position_ids)
+
+        sequence_emb = item_embeddings + position_embeddings
+        sequence_emb = self.LayerNorm(sequence_emb)
+        sequence_emb = self.dropout(sequence_emb)
+
+        # Transformer Encoder
+        item_encoded_layers = self.item_encoder(sequence_emb,
+                                                extended_attention_mask,
+                                                output_all_encoded_layers=True)
+        
+        sequence_output = item_encoded_layers[-1]
+        return sequence_output
