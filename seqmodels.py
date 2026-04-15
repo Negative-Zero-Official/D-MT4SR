@@ -211,7 +211,7 @@ class RelationAwareSASRecModel(SASRecModel):
 # ================== D-MT4SR IMPROVEMENTS (Note: some changes to previous functions) =========================================================
 
 """
-MODEL FOR ABLATION (Compare against Baseline)
+MODELS FOR ABLATION (Compare against Baseline)
 """
 class GNNRelationAwareSASRecModel(SASRecModel):
     """
@@ -269,3 +269,75 @@ class GNNRelationAwareSASRecModel(SASRecModel):
         
         sequence_output = item_encoded_layers[-1]
         return sequence_output
+
+
+"""
+SOTA MODEL
+"""
+class SOTARelationAwareRecModel(SASRecModel):
+    """
+    Modular model combining new techniques with Local Relation-Aware Attention
+    Supports Multi-Task Learning losses
+    """
+    def __init__(self, args, adj_matrix, relationships_ind_map):
+        super(SOTARelationAwareRecModel, self).__init__(args)
+
+        # GNN Component (Toggle-able)
+        self.use_gnn = getattr(args, 'use_gnn', True)
+        if self.use_gnn:
+            self.gnn_encoder = SemanticGNNEncoder(args, adj_matrix)
+            if args.cuda_condition:
+                self.gnn_encoder.adj_matrix = self.gnn_encoder.adj_matrix.cuda()
+        
+        # Relation-Aware Encoder
+        self.num_relationships = len(relationships_ind_map)
+        self.item_encoder = RelationAwareSAEncoder(args, self.num_relationships)
+
+    def finetune(self, input_ids, input_rel_seq_masks):
+        # Embedding Refinement (Global GNN)
+        if self.use_gnn:
+            all_item_embeddings = self.item_embeddings.weight
+            refined_item_table = self.gnn_encoder(all_item_embeddings)
+            item_embeddings = F.embedding(input_ids, refined_item_table)
+        else:
+            item_embeddings = self.item_embeddings(input_ids)
+        
+        # Attention Masking (Casual + Padding)
+        attention_mask = (input_ids > 0).long()
+        extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
+        max_len = attention_mask.size(-1)
+        attn_shape = (1, max_len, max_len)
+        subsequent_mask = torch.triu(torch.ones(attn_shape), diagonal=1)
+        subsequent_mask = (subsequent_mask == 0).unsqueeze(1).long()
+
+        if self.args.cuda_condition:
+            subsequent_mask = subsequent_mask.cuda()
+            input_rel_seq_masks = input_rel_seq_masks.cuda()
+        
+        extended_attention_mask = extended_attention_mask * subsequent_mask
+        extended_attention_mask = extended_attention_mask.to(dtype=next(self.parameters()).dtype)
+        extended_attention_mask = (1.0 - extended_attention_mask) * -10000.0
+        input_rel_seq_masks = input_rel_seq_masks.to(dtype=next(self.parameters()).dtype)
+
+        # Composite Sequence Embedding (Identity + Position)
+        seq_length = input_ids.size(1)
+        position_ids = torch.arange(seq_length, dtype=torch.long, device=input_ids.device)
+        position_ids = position_ids.unsqueeze(0).expand_as(input_ids)
+        position_embeddings = self.position_embeddings(position_ids)
+
+        sequence_emb = item_embeddings + position_embeddings
+        sequence_emb = self.LayerNorm(sequence_emb)
+        sequence_emb = self.dropout(sequence_emb)
+
+        # Relation-Aware Transformer Encoder
+        # This provides the extra variables needed for relationship losses
+        item_encoded_layers, relation_embs_layers, relation_weights_layers = self.item_encoder(
+            sequence_emb,
+            extended_attention_mask,
+            input_rel_seq_masks,
+            output_all_encoded_layers=True
+        )
+
+        sequence_output = item_encoded_layers[-1]
+
+        return sequence_output, sequence_emb, relation_embs_layers, relation_weights_layers

@@ -9,8 +9,8 @@ from tqdm import tqdm
 from torch.utils.data import DataLoader, RandomSampler, SequentialSampler
 
 from datasets import SASRecDataset, RelationAwareSASRecDataset
-from trainers import FinetuneTrainer, DistSAModelTrainer, RelationAwareSASRecModelTrainer
-from seqmodels import SASRecModel, DistSAModel, DistMeanSAModel, RelationAwareSASRecModel, GNNRelationAwareSASRecModel
+from trainers import FinetuneTrainer, DistSAModelTrainer, RelationAwareSASRecModelTrainer, SOTAModelTrainer
+from seqmodels import SASRecModel, DistSAModel, DistMeanSAModel, RelationAwareSASRecModel, GNNRelationAwareSASRecModel, SOTARelationAwareRecModel
 from utils import EarlyStopping, get_user_seqs, get_item2attribute_json, check_path, set_seed, get_user_seqs_MoHRdata, scipy_to_torch_sparse
 
 def main():
@@ -34,8 +34,8 @@ def main():
     parser.add_argument('--max_seq_length', default=50, type=int)
     parser.add_argument('--distance_metric', default='wasserstein', type=str)
     parser.add_argument('--pvn_weight', default=0.1, type=float)
-    parser.add_argument('--rel_loss_weight', default=0.0, type=float)
-    parser.add_argument('--outseq_rel_loss_weight', default=0.0, type=float)
+    parser.add_argument('--rel_loss_weight', default=0.1, type=float)
+    parser.add_argument('--outseq_rel_loss_weight', default=0.1, type=float)
 
     # train args
     parser.add_argument("--lr", type=float, default=0.001, help="learning rate of adam")
@@ -52,6 +52,7 @@ def main():
 
     # D-MT4SR new args
     parser.add_argument("--num_gnn_layers", type=int, default=2, help="number of GNN layers")
+    parser.add_argument("--use_gnn", action="store_true", default=True, help="Toggle GNN refinement")
 
     args = parser.parse_args()
 
@@ -94,7 +95,17 @@ def main():
     checkpoint = args_str + '.pt'
     args.checkpoint_path = os.path.join(args.output_dir, checkpoint)
 
-    if args.model_name != 'RelationAwareSASRecModel':
+    if args.model_name in ['RelationAwareSASRecModel', 'SOTARelationAwareRecModel']:
+        train_dataset = RelationAwareSASRecDataset(args, user_seq, user_seq_mask_mat_rel, relationships_ind_map, Item, data_type='train')
+        train_sampler = RandomSampler(train_dataset)
+        train_dataloader = DataLoader(train_dataset, sampler=train_sampler, batch_size=args.batch_size)
+
+        eval_dataset = RelationAwareSASRecDataset(args, user_seq, user_seq_mask_mat_rel, relationships_ind_map, Item, data_type='valid')
+        eval_sampler = SequentialSampler(eval_dataset)
+
+        test_dataset = RelationAwareSASRecDataset(args, user_seq, user_seq_mask_mat_rel, relationships_ind_map, Item, data_type='test')
+        test_sampler = SequentialSampler(test_dataset)
+    else:
         train_dataset = SASRecDataset(args, user_seq, data_type='train')
         train_sampler = RandomSampler(train_dataset)
         train_dataloader = DataLoader(train_dataset, sampler=train_sampler, batch_size=args.batch_size)
@@ -104,17 +115,6 @@ def main():
         #eval_dataloader = DataLoader(eval_dataset, sampler=eval_sampler, batch_size=200)
 
         test_dataset = SASRecDataset(args, user_seq, data_type='test')
-        test_sampler = SequentialSampler(test_dataset)
-        #test_dataloader = DataLoader(test_dataset, sampler=test_sampler, batch_size=200)
-    else:
-        train_dataset = RelationAwareSASRecDataset(args, user_seq, user_seq_mask_mat_rel, relationships_ind_map, Item, data_type='train')
-        train_sampler = RandomSampler(train_dataset)
-        train_dataloader = DataLoader(train_dataset, sampler=train_sampler, batch_size=args.batch_size)
-
-        eval_dataset = RelationAwareSASRecDataset(args, user_seq, user_seq_mask_mat_rel, relationships_ind_map, Item, data_type='valid')
-        eval_sampler = SequentialSampler(eval_dataset)
-
-        test_dataset = RelationAwareSASRecDataset(args, user_seq, user_seq_mask_mat_rel, relationships_ind_map, Item, data_type='test')
         test_sampler = SequentialSampler(test_dataset)
 
 
@@ -146,6 +146,12 @@ def main():
         test_dataloader = DataLoader(test_dataset, sampler=test_sampler, batch_size=args.batch_size)
         trainer = FinetuneTrainer(model, train_dataloader, eval_dataloader,
                                 test_dataloader, args)
+    elif args.model_name == 'SOTARelationAwareRecModel':
+        model = SOTARelationAwareRecModel(args, adj_matrix, relationships_ind_map)
+        eval_dataloader = DataLoader(eval_dataset, sampler=eval_sampler, batch_size=args.batch_size)
+        test_dataloader = DataLoader(test_dataset, sampler=test_sampler, batch_size=args.batch_size)
+        trainer = RelationAwareSASRecModelTrainer(model, train_dataloader, eval_dataloader,
+                                                test_dataloader, args)
 
 
     else:
