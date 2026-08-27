@@ -608,6 +608,164 @@ class RelationAwareSAEncoder(nn.Module):
 
 
 
+# ---------------------------------------------------------------------------
+# D-MT4SR additions: dynamic (context-conditioned, time-decayed) relation weighting
+#
+# In the original MT4SR (RelationAwareSelfAttention above), each relationship r
+# contributes to attention via a *global* learnable scalar `relationship_weights[r]`,
+# softmax-normalized once and shared across every user, sequence position, and
+# batch for the entire dataset. This means the model can never express, e.g.,
+# "this user's next-item intent leans more on 'co-searched' than 'similar brand'"
+# or "this relation matters less the further back the related item was" -- both
+# of which the MT4SR paper explicitly motivates but the architecture can't act on.
+#
+# DynamicRelationAwareSelfAttention replaces the fixed relation-weight vector
+# with a small gating network conditioned on the current hidden states, so the
+# relative importance of each relationship is computed per-sequence-position
+# instead of once globally. It optionally also applies a learnable per-relationship
+# decay as a function of the position gap between two items in the sequence, as
+# a practical proxy for recency/time-decay (real interaction timestamps are
+# discarded in the current preprocessing pipeline -- see preprocess_fromscratch.py
+# -- so position distance is used as the available stand-in signal).
+#
+# Everything else (Q/K/V projections, the relationship_embedding "normal matrix"
+# trick from ANALOGY, causal masking, dropout, residual + LayerNorm) is identical
+# to RelationAwareSelfAttention, so this is a drop-in replacement with the same
+# forward() signature -- it can be swapped in via --model_name without touching
+# the rest of the pipeline.
+# ---------------------------------------------------------------------------
+
+class DynamicRelationAwareSelfAttention(RelationAwareSelfAttention):
+    def __init__(self, args, num_relationships):
+        super(DynamicRelationAwareSelfAttention, self).__init__(args, num_relationships)
+
+        # Context-conditioned relation gate: replaces the single global
+        # `relationship_weights` vector with a per-position distribution over
+        # relationships, predicted from the current hidden state at each
+        # sequence position (i.e., dynamic per user/sequence/timestep instead
+        # of fixed for the whole dataset).
+        self.relation_gate = nn.Linear(args.hidden_size, num_relationships)
+        # `relationship_weights` is inherited from the parent class but is no
+        # longer used in forward() below; kept only so code that introspects
+        # RelationAwareSelfAttention-family modules doesn't break on attribute
+        # access. The actual weighting comes from relation_gate instead.
+
+        self.use_time_decay = getattr(args, 'use_time_decay', False)
+        if self.use_time_decay:
+            # One learnable decay rate per relationship. Larger rate = relation's
+            # influence falls off faster with sequence-position distance.
+            # Initialized small (slow decay) so the model starts close to the
+            # non-decayed behavior and can learn stronger decay if useful.
+            self.decay_rate = nn.Parameter(torch.ones(num_relationships) * 0.01)
+
+    def forward(self, input_tensor, attention_mask, input_relationships_masks):
+        # relationship_embedding shape: [num_rel, d, d]
+        # input_relationships_masks shape: [num_rel, L, L]
+
+        mixed_query_layer = self.query(input_tensor)
+        mixed_key_layer = self.key(input_tensor)
+        mixed_value_layer = self.value(input_tensor)
+
+        query_layer = self.transpose_for_scores(mixed_query_layer)
+        key_layer = self.transpose_for_scores(mixed_key_layer)
+        value_layer = self.transpose_for_scores(mixed_value_layer)
+
+        attention_scores = torch.matmul(query_layer, key_layer.transpose(-1, -2))
+        attention_scores = attention_scores / math.sqrt(self.attention_head_size)
+        attention_scores = attention_scores + attention_mask
+
+        relationship_embedding_sym = torch.bmm(self.relationship_embedding, self.relationship_embedding)
+
+        relationship_mapping = torch.einsum("ijk,ltk->ijlt", (input_tensor, relationship_embedding_sym))  # (B, L, num_rel, d)
+        relationship_mapping = relationship_mapping.permute(0, 2, 1, 3).contiguous()  # (B, num_rel, L, d)
+        relationship_heads_mapping = self.transpose_for_scores_relation(relationship_mapping)  # (B, num_rel, h, L, d/h)
+        relationship_att_scores = torch.matmul(relationship_heads_mapping, relationship_heads_mapping.transpose(-1, -2))  # (B, num_rel, h, L, L)
+        relationship_att_scores = relationship_att_scores / math.sqrt(self.attention_head_size)
+        # NOTE: matches RelationAwareSelfAttention -- input_relationships_masks is
+        # computed/available but not applied here either, to keep this an
+        # apples-to-apples ablation of *only* the dynamic-weighting change.
+        relationship_att_scores = relationship_att_scores.permute(0, 2, 3, 4, 1).contiguous()  # (B, h, L, L, num_rel)
+
+        batch_size, seq_len = input_tensor.size(0), input_tensor.size(1)
+
+        # --- Dynamic, context-conditioned relation weighting ---
+        # gate_logits: (B, L, num_rel) -- a distribution over relationships
+        # predicted independently for each query position from its current
+        # representation, instead of one fixed vector for the whole dataset.
+        gate_logits = self.relation_gate(input_tensor)
+        dynamic_weights = nn.Softmax(dim=-1)(gate_logits)  # (B, L, num_rel)
+        # Reshape for broadcasting against (B, h, L, L, num_rel): weight is
+        # per query position (dim=2), shared across heads and key positions.
+        dynamic_weights = dynamic_weights.unsqueeze(1).unsqueeze(3)  # (B, 1, L, 1, num_rel)
+
+        if self.use_time_decay:
+            positions = torch.arange(seq_len, dtype=torch.float, device=input_tensor.device)
+            pos_gap = (positions.unsqueeze(1) - positions.unsqueeze(0)).abs()  # (L, L), gap between query i and key j
+            decay_rate = torch.clamp(self.decay_rate, min=1e-4)  # (num_rel,), keep decay well-behaved
+            decay = torch.exp(-decay_rate.view(1, 1, -1) * pos_gap.unsqueeze(-1))  # (L, L, num_rel)
+            decay = decay.unsqueeze(0).unsqueeze(0)  # (1, 1, L, L, num_rel)
+            combined_weights = dynamic_weights * decay  # (B, 1, L, L, num_rel)
+        else:
+            combined_weights = dynamic_weights  # broadcasts over key-position dim
+
+        rel_sum_relationship_att_scores = torch.sum(relationship_att_scores * combined_weights, dim=-1)  # (B, h, L, L)
+
+        attention_probs = nn.Softmax(dim=-1)(attention_scores.clone() + rel_sum_relationship_att_scores)
+
+        attention_probs = self.attn_dropout(attention_probs)
+        context_layer = torch.matmul(attention_probs, value_layer)
+        context_layer = context_layer.permute(0, 2, 1, 3).contiguous()
+        new_context_layer_shape = context_layer.size()[:-2] + (self.all_head_size,)
+        context_layer = context_layer.view(*new_context_layer_shape)
+        hidden_states = self.dense(context_layer)
+        hidden_states = self.out_dropout(hidden_states)
+        hidden_states = self.LayerNorm(hidden_states + input_tensor)
+
+        return hidden_states
+
+
+class DynamicRelationAwareLayer(nn.Module):
+    def __init__(self, args, num_relationships):
+        super(DynamicRelationAwareLayer, self).__init__()
+        self.attention = DynamicRelationAwareSelfAttention(args, num_relationships)
+        self.intermediate = Intermediate(args)
+
+    def forward(self, hidden_states, attention_mask, input_relationships_masks):
+        attention_output = self.attention(hidden_states, attention_mask, input_relationships_masks)
+        intermediate_output = self.intermediate(attention_output)
+        return intermediate_output
+
+
+class DynamicRelationAwareSAEncoder(nn.Module):
+    def __init__(self, args, num_relationships):
+        super(DynamicRelationAwareSAEncoder, self).__init__()
+        layer = DynamicRelationAwareLayer(args, num_relationships)
+        self.layer = nn.ModuleList([copy.deepcopy(layer)
+                                    for _ in range(args.num_hidden_layers)])
+
+    def forward(self, hidden_states, attention_mask, input_relationships_masks, output_all_encoded_layers=True):
+        all_encoder_layers = []
+        relation_embs_all_layers = []
+        relation_gates_all_layers = []
+
+        for layer_module in self.layer:
+            hidden_states = layer_module(hidden_states, attention_mask, input_relationships_masks)
+            if output_all_encoded_layers:
+                all_encoder_layers.append(hidden_states)
+                relation_embs_all_layers.append(layer_module.attention.relationship_embedding)
+                # The "dynamic" analogue of the original's global relationship_weights:
+                # here it's the gating linear layer itself (per-instance weights are
+                # only materialized at forward time, so we expose the module that
+                # produces them rather than a single fixed tensor).
+                relation_gates_all_layers.append(layer_module.attention.relation_gate)
+        if not output_all_encoded_layers:
+            all_encoder_layers.append(hidden_states)
+            relation_embs_all_layers.append(self.layer[-1].attention.relationship_embedding)
+            relation_gates_all_layers.append(self.layer[-1].attention.relation_gate)
+
+        return all_encoder_layers, relation_embs_all_layers, relation_gates_all_layers
+
+
 class Encoder(nn.Module):
     def __init__(self, args):
         super(Encoder, self).__init__()
@@ -624,35 +782,3 @@ class Encoder(nn.Module):
         if not output_all_encoded_layers:
             all_encoder_layers.append(hidden_states)
         return all_encoder_layers
-
-
-
-# ================== D-MT4SR IMPROVEMENTS (Note: some changes to previous functions) =========================================================
-
-class SemanticGNNEncoder(nn.Module):
-    """
-    Refines item embeddings by aggregating information from semantic neighbors.
-    Uses LightGCN-style linear message passing for efficiency.
-    """
-    def __init__(self, args, adj_matrix):
-        super(SemanticGNNEncoder, self).__init__()
-        self.adj_matrix = adj_matrix
-        self.num_layers = args.num_gnn_layers if hasattr(args, 'num_gnn_layers') else 2
-    
-    def forward(self, item_embeddings):
-        """
-        item_embeddings: Inital embedding table (E^0) of shape [num_items, hidden_size]
-        """
-        all_embeddings = [item_embeddings]
-        current_emb = item_embeddings
-
-        for _ in range(self.num_layers):
-            # Code GNN operation: E^(l+1) = Adjacency * E^(l)
-            # This mixes the features of related items globally
-            current_emb = torch.sparse.mm(self.adj_matrix, current_emb)
-            all_embeddings.append(current_emb)
-        
-        # Final representation is the average across all hops
-        # This captures both immediate (1-hop) and transitive (multi-hop) relations
-        final_embeddings = torch.stack(all_embeddings, dim=1).mean(dim=1)
-        return final_embeddings

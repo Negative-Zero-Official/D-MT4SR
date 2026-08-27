@@ -1,7 +1,6 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from modules import Encoder, LayerNorm, DistSAEncoder, DistMeanSAEncoder, RelationAwareSAEncoder, SemanticGNNEncoder
+from modules import Encoder, LayerNorm, DistSAEncoder, DistMeanSAEncoder, RelationAwareSAEncoder, DynamicRelationAwareSAEncoder
 
 class SASRecModel(nn.Module):
     def __init__(self, args):
@@ -207,137 +206,40 @@ class RelationAwareSASRecModel(SASRecModel):
         return sequence_output, sequence_emb, relation_embs_layers, relation_weights_layers
 
 
+class DynamicRelationAwareSASRecModel(RelationAwareSASRecModel):
+    """D-MT4SR model.
 
-# ================== D-MT4SR IMPROVEMENTS (Note: some changes to previous functions) =========================================================
+    Same overall architecture as RelationAwareSASRecModel (MT4SR): item +
+    position embeddings, causal self-attention, next-item prediction head, and
+    the same Lintra/Linter regularization pathway in the trainer. The only
+    architectural change is swapping in DynamicRelationAwareSAEncoder, which
+    replaces MT4SR's single global per-relationship weight with context-
+    conditioned (and optionally position/time-decayed) relation weighting --
+    see modules.DynamicRelationAwareSelfAttention for details.
 
-"""
-MODELS FOR ABLATION (Compare against Baseline)
-"""
-class GNNRelationAwareSASRecModel(SASRecModel):
+    Also adds two small learnable scalars (log_alpha_scale, log_beta_scale)
+    used only when args.dynamic_loss_weights is set: they let the trainer
+    (DynamicRelationAwareSASRecModelTrainer) learn an adaptive multiplicative
+    correction on top of the static, grid-searched rel_loss_weight /
+    outseq_rel_loss_weight hyperparameters from the original paper, instead of
+    using them as fixed constants. They are inert (unused) when
+    args.dynamic_loss_weights is False, so the base model behaves identically
+    to MT4SR aside from the relation-weighting change above.
     """
-    Extension of SASRec that uses a Global GNN to refine item representations based on semantic relationships
-    """
-    def __init__(self, args, adj_matrix):
-        super(GNNRelationAwareSASRecModel, self).__init__(args)
-        # Store the GNN Encoder
-        self.gnn_encoder = SemanticGNNEncoder(args, adj_matrix)
 
-        # Ensure adjacency matrix moves to the correct device
-        if args.cuda_condition:
-            self.gnn_encoder.adj_matrix = self.gnn_encoder.adj_matrix.cuda()
-    
-    def finetune(self, input_ids):
-        # Global GNN Refinement
-        # Pass the entire embedding table through the GNN
-        all_item_embeddings = self.item_embeddings.weight # [num_items, d]
-        refined_item_table = self.gnn_encoder(all_item_embeddings) # [num_items, d]
+    def __init__(self, args, relationships_ind_map):
+        super(DynamicRelationAwareSASRecModel, self).__init__(args, relationships_ind_map)
+        self.item_encoder = DynamicRelationAwareSAEncoder(args, self.num_relationships)
 
-        # Standard SASRec Processing
-        # Instead of using self.item_embeddings(input_ids), index the refined table
-        # Use F.embedding for efficiency on the refined table
-        attention_mask = (input_ids > 0).long()
-        extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
-        max_len = attention_mask.size(-1)
-        attn_shape = (1, max_len, max_len)
-        subsequent_mask = torch.triu(torch.ones(attn_shape), diagonal=1)
-        subsequent_mask = (subsequent_mask == 0).unsqueeze(1).long()
+        # Learnable log-scale adjustments for the intra-/inter-sequence
+        # regularization weights (D-MT4SR dynamic loss weighting). Initialized
+        # to 0 so exp(0) = 1, i.e. training starts exactly at the static
+        # args.rel_loss_weight / args.outseq_rel_loss_weight values and can
+        # only diverge from them if the data supports it.
+        self.log_alpha_scale = nn.Parameter(torch.zeros(1))
+        self.log_beta_scale = nn.Parameter(torch.zeros(1))
 
-        if self.args.cuda_condition:
-            subsequent_mask = subsequent_mask.cuda()
-        
-        extended_attention_mask = extended_attention_mask * subsequent_mask
-        extended_attention_mask = extended_attention_mask.to(dtype=next(self.parameters()).dtype)
-        extended_attention_mask = (1.0 - extended_attention_mask) * -10000.0
-
-        # Create the sequence embeddings using the refined GNN table
-        item_embeddings = F.embedding(input_ids, refined_item_table)
-
-        # Add positions (standard Transformer logic)
-        seq_length = input_ids.size(1)
-        position_ids = torch.arange(seq_length, dtype=torch.long, device=input_ids.device)
-        position_ids = position_ids.unsqueeze(0).expand_as(input_ids)
-        position_embeddings = self.position_embeddings(position_ids)
-
-        sequence_emb = item_embeddings + position_embeddings
-        sequence_emb = self.LayerNorm(sequence_emb)
-        sequence_emb = self.dropout(sequence_emb)
-
-        # Transformer Encoder
-        item_encoded_layers = self.item_encoder(sequence_emb,
-                                                extended_attention_mask,
-                                                output_all_encoded_layers=True)
-        
-        sequence_output = item_encoded_layers[-1]
-        return sequence_output
-
-
-"""
-SOTA MODEL
-"""
-class SOTARelationAwareRecModel(SASRecModel):
-    """
-    Modular model combining new techniques with Local Relation-Aware Attention
-    Supports Multi-Task Learning losses
-    """
-    def __init__(self, args, adj_matrix, relationships_ind_map):
-        super(SOTARelationAwareRecModel, self).__init__(args)
-
-        # GNN Component (Toggle-able)
-        self.use_gnn = getattr(args, 'use_gnn', True)
-        if self.use_gnn:
-            self.gnn_encoder = SemanticGNNEncoder(args, adj_matrix)
-            if args.cuda_condition:
-                self.gnn_encoder.adj_matrix = self.gnn_encoder.adj_matrix.cuda()
-        
-        # Relation-Aware Encoder
-        self.num_relationships = len(relationships_ind_map)
-        self.item_encoder = RelationAwareSAEncoder(args, self.num_relationships)
-
-    def finetune(self, input_ids, input_rel_seq_masks):
-        # Embedding Refinement (Global GNN)
-        if self.use_gnn:
-            all_item_embeddings = self.item_embeddings.weight
-            refined_item_table = self.gnn_encoder(all_item_embeddings)
-            item_embeddings = F.embedding(input_ids, refined_item_table)
-        else:
-            item_embeddings = self.item_embeddings(input_ids)
-        
-        # Attention Masking (Casual + Padding)
-        attention_mask = (input_ids > 0).long()
-        extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
-        max_len = attention_mask.size(-1)
-        attn_shape = (1, max_len, max_len)
-        subsequent_mask = torch.triu(torch.ones(attn_shape), diagonal=1)
-        subsequent_mask = (subsequent_mask == 0).unsqueeze(1).long()
-
-        if self.args.cuda_condition:
-            subsequent_mask = subsequent_mask.cuda()
-            input_rel_seq_masks = input_rel_seq_masks.cuda()
-        
-        extended_attention_mask = extended_attention_mask * subsequent_mask
-        extended_attention_mask = extended_attention_mask.to(dtype=next(self.parameters()).dtype)
-        extended_attention_mask = (1.0 - extended_attention_mask) * -10000.0
-        input_rel_seq_masks = input_rel_seq_masks.to(dtype=next(self.parameters()).dtype)
-
-        # Composite Sequence Embedding (Identity + Position)
-        seq_length = input_ids.size(1)
-        position_ids = torch.arange(seq_length, dtype=torch.long, device=input_ids.device)
-        position_ids = position_ids.unsqueeze(0).expand_as(input_ids)
-        position_embeddings = self.position_embeddings(position_ids)
-
-        sequence_emb = item_embeddings + position_embeddings
-        sequence_emb = self.LayerNorm(sequence_emb)
-        sequence_emb = self.dropout(sequence_emb)
-
-        # Relation-Aware Transformer Encoder
-        # This provides the extra variables needed for relationship losses
-        item_encoded_layers, relation_embs_layers, relation_weights_layers = self.item_encoder(
-            sequence_emb,
-            extended_attention_mask,
-            input_rel_seq_masks,
-            output_all_encoded_layers=True
-        )
-
-        sequence_output = item_encoded_layers[-1]
-
-        return sequence_output, sequence_emb, relation_embs_layers, relation_weights_layers
+    # finetune() is inherited unchanged from RelationAwareSASRecModel: it calls
+    # self.item_encoder(...) generically, and DynamicRelationAwareSAEncoder
+    # matches the same (all_encoder_layers, relation_embs_layers, extra_list)
+    # return signature, so no override is needed here.

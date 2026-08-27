@@ -70,7 +70,7 @@ class EarlyStopping:
             self.save_checkpoint(score, model)
         elif self.compare(score):
             self.counter += 1
-            tqdm.write(f'EarlyStopping counter: {self.counter} out of {self.patience}')
+            print(f'EarlyStopping counter: {self.counter} out of {self.patience}')
             if self.counter >= self.patience:
                 self.early_stop = True
         else:
@@ -81,7 +81,7 @@ class EarlyStopping:
     def save_checkpoint(self, score, model):
         '''Saves model when validation loss decrease.'''
         if self.verbose:
-            tqdm.write('Validation score increased.  Saving model ...')
+            print(f'Validation score increased.  Saving model ...')
         torch.save(model.state_dict(), self.checkpoint_path)
         self.score_min = score
 
@@ -149,7 +149,7 @@ def get_user_seqs(data_file):
     return user_seq, max_item, valid_rating_matrix, test_rating_matrix, num_users
 
 def get_user_seqs_MoHRdata(dataset):
-    dataset = np.load('data\\'+dataset+'Partitioned_5core.npy', allow_pickle=True)
+    dataset = np.load('../data/'+dataset+'Partitioned_5core.npy', allow_pickle=True)
     [user_train, user_validation, user_test, Item, Item_relationship_mask_mat_completeseqs, relationships_ind, usernum, itemnum] = dataset
 
     user_seq = []
@@ -180,12 +180,9 @@ def get_user_seqs_MoHRdata(dataset):
             new_related_dict[rel_ind] = reindex_rel_i_list
         new_Item[reindex_item] = new_related_dict
 
-    # NEW: Generate global adjacency matrix using the reindexed new_Item
-    adj_matrix = generate_global_adj_matrix(new_Item, num_items)
-
     valid_rating_matrix = generate_rating_matrix_valid(user_seq, num_users, num_items)
     test_rating_matrix = generate_rating_matrix_test(user_seq, num_users, num_items)
-    return user_seq, max_item, valid_rating_matrix, test_rating_matrix, num_users, user_seq_mask_mat_rel, relationships_ind, new_Item, adj_matrix
+    return user_seq, max_item, valid_rating_matrix, test_rating_matrix, num_users, user_seq_mask_mat_rel, relationships_ind, new_Item
 
 def get_user_seqs_long(data_file):
     lines = open(data_file).readlines()
@@ -297,7 +294,7 @@ def cal_mrr(actual, predicted):
         r = np.array(r)
         if np.sum(r) > 0:
             #sum_mrr += np.reciprocal(np.where(r==1)[0]+1, dtype=np.float)[0]
-            one_user_mrr = np.reciprocal(np.where(r==1)[0]+1, dtype=np.float64)[0]
+            one_user_mrr = np.reciprocal(np.where(r==1)[0]+1, dtype=np.float)[0]
             sum_mrr += one_user_mrr
             true_users += 1
             mrr_dict[i] = one_user_mrr
@@ -314,7 +311,7 @@ def apk(actual, predicted, k=10):
     Parameters
     ----------
     actual : list
-             A list of elements that are to be predicted (order doesn't matter)
+                A list of elements that are to be predicted (order doesn't matter)
     predicted : list
                 A list of predicted elements (order does matter)
     k : int, optional
@@ -349,8 +346,8 @@ def mapk(actual, predicted, k=10):
     Parameters
     ----------
     actual : list
-             A list of lists of elements that are to be predicted
-             (order doesn't matter in the lists)
+                A list of lists of elements that are to be predicted
+                (order doesn't matter in the lists)
     predicted : list
                 A list of lists of predicted elements
                 (order matters in the lists)
@@ -369,8 +366,7 @@ def ndcg_k(actual, predicted, topk):
     for user_id in range(len(actual)):
         k = min(topk, len(actual[user_id]))
         idcg = idcg_k(k)
-        dcg_k = sum([int(predicted[user_id][j] in
-                         set(actual[user_id])) / math.log(j+2, 2) for j in range(topk)])
+        dcg_k = sum([int(predicted[user_id][j] in set(actual[user_id])) / math.log(j+2, 2) for j in range(topk)])
         res += dcg_k / idcg
         ndcg_dict[user_id] = dcg_k / idcg
     return res / float(len(actual)), ndcg_dict
@@ -654,50 +650,67 @@ def get_item_performance_perpopularity(items_in_freqintervals, all_pos_items_ran
             print('Recall@%d:%.6f, NDCG@%d:%.6f'%(k, interval_results[i]['recall'][k_ind], k, interval_results[i]['ndcg'][k_ind]))
 
 
+# ---------------------------------------------------------------------------
+# D-MT4SR additions: popularity-aware negative sampling
+#
+# The original MT4SR/SASRec pipeline samples negatives uniformly at random via
+# `neg_sample`. Uniform negatives are mostly "easy" (very unlikely to be
+# confused with the positive item), which caps how informative the gradient
+# signal is. D-MT4SR optionally replaces this with popularity-aware sampling
+# (the standard word2vec-style freq^0.75 trick), which biases sampling towards
+# popular items and produces harder, more informative negatives. This is
+# purely additive: `neg_sample` is untouched, so the original MT4SR models are
+# unaffected, and the new sampler is only used when a dataset/trainer opts in.
+# ---------------------------------------------------------------------------
 
-# ================== D-MT4SR IMPROVEMENTS (Note: some changes to previous functions) =========================================================
+def compute_item_popularity(user_seq, max_item):
+    """Computes raw interaction frequency for each item id in [0, max_item+1].
 
-def generate_global_adj_matrix(new_Item, num_items):
+    Item id 0 is reserved for padding and is not a real item. This mirrors the
+    item id space used throughout datasets.py/main.py (`args.item_size = max_item + 2`).
     """
-    Constructs a normalized sparse adjacency matrix from the Item relationships
+    freq = np.zeros(max_item + 2)
+    for seq in user_seq:
+        for item in seq:
+            freq[item] += 1
+    return freq
+
+
+def build_popularity_sampling_probs(item_freq, power=0.75):
+    """Builds a smoothed sampling distribution over items for negative sampling.
+
+    Uses the standard freq^power smoothing (power=0.75 by default, as in
+    word2vec negative sampling) so that popular items are oversampled relative
+    to uniform sampling, but rare items still retain some sampling mass.
+    Item id 0 (padding) is always excluded. Returns None if there is no usable
+    signal (e.g., all-zero frequencies), in which case callers should fall
+    back to uniform `neg_sample`.
     """
-    row = []
-    col = []
-    data = []
+    probs = np.power(item_freq, power)
+    probs[0] = 0.0
+    total = probs.sum()
+    if total <= 0:
+        return None
+    return probs / total
 
-    for item_i, related_dict in new_Item.items():
-        for rel_type, related_items in related_dict.items():
-            for item_j in related_items:
-                # Add edge i -> j
-                row.append(item_i)
-                col.append(item_j)
-                data.append(1)
 
-                # Treat relationships as undirected
-                row.append(item_j)
-                col.append(item_i)
-                data.append(1)
-    
-    adj = csr_matrix((data, (row, col)), shape=(num_items, num_items))
+def neg_sample_popularity(item_set, item_size, sampling_probs):
+    """Popularity-aware negative sampling for D-MT4SR.
 
-    # Simple normalization
-    rowsum = np.array(adj.sum(1)).astype(float)
-    d_inv = np.power(1.0, rowsum, where=rowsum!=0, out=np.zeros_like(rowsum)).flatten()
-    d_inv[np.isinf(d_inv)] = 0.
-    d_mat_inv = csr_matrix((d_inv, (np.arange(num_items), np.arange(num_items))), shape=(num_items, num_items))
-    norm_adj = d_mat_inv.dot(adj)
-
-    return norm_adj
-
-def scipy_to_torch_sparse(sparse_mx):
+    Draws a candidate item from `sampling_probs` (see build_popularity_sampling_probs)
+    and rejects it if it collides with an item already in `item_set` (i.e., it's
+    actually a positive for this sequence). Falls back to uniform `neg_sample`
+    if no sampling distribution is available or rejection sampling stalls,
+    guaranteeing this never hangs or breaks the training loop.
     """
-    Converts a scipy sparse matrix to a torch sparse tensor
-    """
-    sparse_mx = sparse_mx.tocoo().astype(np.float32)
-    indices = torch.from_numpy(
-        np.vstack((sparse_mx.row, sparse_mx.col)).astype(np.int64)
-    )
-    values = torch.from_numpy(sparse_mx.data)
-    shape = torch.Size(sparse_mx.shape)
+    if sampling_probs is None:
+        return neg_sample(item_set, item_size)
 
-    return torch.sparse_coo_tensor(indices, values, shape)
+    item = np.random.choice(len(sampling_probs), p=sampling_probs)
+    tries = 0
+    while item in item_set or item == 0:
+        item = np.random.choice(len(sampling_probs), p=sampling_probs)
+        tries += 1
+        if tries > 50:
+            return neg_sample(item_set, item_size)
+    return item

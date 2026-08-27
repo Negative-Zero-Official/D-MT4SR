@@ -7,9 +7,9 @@ import json
 import numpy as np
 
 def parse(path):
-  g = gzip.open(path, 'r')
-  for l in g:
-      yield eval(l)
+    g = gzip.open(path, 'r')
+    for l in g:
+        yield eval(l)
 
 
 DATASET = 'Office_Products'

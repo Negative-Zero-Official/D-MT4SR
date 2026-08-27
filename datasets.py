@@ -4,7 +4,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from utils import neg_sample
+from utils import neg_sample, neg_sample_popularity
 
 class PretrainDataset(Dataset):
 
@@ -57,12 +57,9 @@ class PretrainDataset(Dataset):
             neg_start_id = random.randint(0, len(self.long_sequence) - sample_length)
             pos_segment = sequence[start_id: start_id + sample_length]
             neg_segment = self.long_sequence[neg_start_id:neg_start_id + sample_length]
-            masked_segment_sequence = sequence[:start_id] + [self.args.mask_id] * sample_length + sequence[
-                                                                                      start_id + sample_length:]
-            pos_segment = [self.args.mask_id] * start_id + pos_segment + [self.args.mask_id] * (
-                        len(sequence) - (start_id + sample_length))
-            neg_segment = [self.args.mask_id] * start_id + neg_segment + [self.args.mask_id] * (
-                        len(sequence) - (start_id + sample_length))
+            masked_segment_sequence = sequence[:start_id] + [self.args.mask_id] * sample_length + sequence[start_id + sample_length:]
+            pos_segment = [self.args.mask_id] * start_id + pos_segment + [self.args.mask_id] * (len(sequence) - (start_id + sample_length))
+            neg_segment = [self.args.mask_id] * start_id + neg_segment + [self.args.mask_id] * (len(sequence) - (start_id + sample_length))
 
         assert len(masked_segment_sequence) == len(sequence)
         assert len(pos_segment) == len(sequence)
@@ -109,12 +106,12 @@ class PretrainDataset(Dataset):
 
 
         cur_tensors = (torch.tensor(attributes, dtype=torch.long),
-                       torch.tensor(masked_item_sequence, dtype=torch.long),
-                       torch.tensor(pos_items, dtype=torch.long),
-                       torch.tensor(neg_items, dtype=torch.long),
-                       torch.tensor(masked_segment_sequence, dtype=torch.long),
-                       torch.tensor(pos_segment, dtype=torch.long),
-                       torch.tensor(neg_segment, dtype=torch.long),)
+                        torch.tensor(masked_item_sequence, dtype=torch.long),
+                        torch.tensor(pos_items, dtype=torch.long),
+                        torch.tensor(neg_items, dtype=torch.long),
+                        torch.tensor(masked_segment_sequence, dtype=torch.long),
+                        torch.tensor(pos_segment, dtype=torch.long),
+                        torch.tensor(neg_segment, dtype=torch.long),)
         return cur_tensors
 
 class SASRecDataset(Dataset):
@@ -161,7 +158,7 @@ class SASRecDataset(Dataset):
         target_neg = []
         seq_set = set(items)
         for _ in input_ids:
-            target_neg.append(neg_sample(seq_set, self.args.item_size))
+            target_neg.append(self.sample_negative(seq_set))
 
         pad_len = self.max_len - len(input_ids)
         input_ids = [0] * pad_len + input_ids
@@ -197,6 +194,12 @@ class SASRecDataset(Dataset):
             )
 
         return cur_tensors
+
+    def sample_negative(self, seq_set):
+        """Negative sampling hook. Default: uniform random, identical to original
+        MT4SR/SASRec behavior. Overridden by D-MT4SR dataset variants for
+        popularity-aware sampling."""
+        return neg_sample(seq_set, self.args.item_size)
 
     def __len__(self):
         return len(self.user_seq)
@@ -277,7 +280,7 @@ class RelationAwareSASRecDataset(Dataset):
         target_neg = []
         seq_set = set(items)
         for _ in input_ids:
-            target_neg.append(neg_sample(seq_set, self.args.item_size))
+            target_neg.append(self.sample_negative(seq_set))
 
         pad_len = self.max_len - len(input_ids)
         input_ids = [0] * pad_len + input_ids
@@ -320,5 +323,39 @@ class RelationAwareSASRecDataset(Dataset):
 
         return cur_tensors
 
+    def sample_negative(self, seq_set):
+        """Negative sampling hook. Default: uniform random, identical to original
+        MT4SR behavior. Overridden by DynamicRelationAwareSASRecDataset for
+        popularity-aware sampling."""
+        return neg_sample(seq_set, self.args.item_size)
+
     def __len__(self):
         return len(self.user_seq)
+
+
+class DynamicRelationAwareSASRecDataset(RelationAwareSASRecDataset):
+    """D-MT4SR dataset.
+
+    Identical to RelationAwareSASRecDataset (same relation masks, same
+    intra-/inter-sequence item_rel sampling) except it optionally swaps in
+    popularity-aware negative sampling (see utils.neg_sample_popularity) when
+    `args.popularity_neg_sampling` is set and a sampling distribution is
+    provided. This isolates the "dynamic negative sampling" contribution so it
+    can be toggled and compared independently of the other D-MT4SR changes
+    (dynamic relation weighting, time decay, adaptive loss weighting), which
+    live in the model/trainer instead.
+    """
+
+    def __init__(self, args, user_seq, relationship_mask_mat_fullseqs, relationships_ind_map, Item,
+                 test_neg_items=None, data_type='train', sampling_probs=None):
+        super(DynamicRelationAwareSASRecDataset, self).__init__(
+            args, user_seq, relationship_mask_mat_fullseqs, relationships_ind_map, Item,
+            test_neg_items=test_neg_items, data_type=data_type)
+        # Precomputed popularity sampling distribution (see utils.build_popularity_sampling_probs).
+        # None => falls back to uniform sampling, identical to the original MT4SR dataset.
+        self.sampling_probs = sampling_probs
+
+    def sample_negative(self, seq_set):
+        if getattr(self.args, 'popularity_neg_sampling', False) and self.sampling_probs is not None:
+            return neg_sample_popularity(seq_set, self.args.item_size, self.sampling_probs)
+        return super(DynamicRelationAwareSASRecDataset, self).sample_negative(seq_set)

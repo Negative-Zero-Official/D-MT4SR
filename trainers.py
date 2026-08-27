@@ -17,8 +17,8 @@ from modules import wasserstein_distance, kl_distance, wasserstein_distance_matm
 
 class Trainer:
     def __init__(self, model, train_dataloader,
-                 eval_dataloader,
-                 test_dataloader, args):
+                eval_dataloader,
+                test_dataloader, args):
 
         self.args = args
         self.cuda_condition = torch.cuda.is_available() and not self.args.no_cuda
@@ -69,7 +69,7 @@ class Trainer:
             "HIT@10": '{:.4f}'.format(HIT_10), "NDCG@10": '{:.4f}'.format(NDCG_10),
             "MRR": '{:.4f}'.format(MRR),
         }
-        tqdm.tqdm.write(str(post_fix))
+        print(post_fix, flush=True)
         with open(self.args.log_file, 'a') as f:
             f.write(str(post_fix) + '\n')
         return [HIT_1, NDCG_1, HIT_5, NDCG_5, HIT_10, NDCG_10, MRR], str(post_fix), None
@@ -96,7 +96,7 @@ class Trainer:
             "HIT@40": '{:.8f}'.format(recall[5]), "NDCG@40": '{:.8f}'.format(ndcg[5]),
             "MRR": '{:.8f}'.format(mrr)
         }
-        tqdm.tqdm.write(str(post_fix))
+        print(post_fix, flush=True)
         with open(self.args.log_file, 'a') as f:
             f.write(str(post_fix) + '\n')
         return [recall[0], ndcg[0], recall[1], ndcg[1], recall[2], ndcg[2], recall[3], ndcg[3], recall[4], ndcg[4], recall[5], ndcg[5], mrr], str(post_fix), [recall_dict_list, ndcg_dict_list, mrr_dict]
@@ -159,9 +159,9 @@ class Trainer:
 class PretrainTrainer(Trainer):
 
     def __init__(self, model,
-                 train_dataloader,
-                 eval_dataloader,
-                 test_dataloader, args):
+                train_dataloader,
+                eval_dataloader,
+                test_dataloader, args):
         super(PretrainTrainer, self).__init__(
             model,
             train_dataloader,
@@ -172,14 +172,14 @@ class PretrainTrainer(Trainer):
     def pretrain(self, epoch, pretrain_dataloader):
 
         desc = f'AAP-{self.args.aap_weight}-' \
-               f'MIP-{self.args.mip_weight}-' \
-               f'MAP-{self.args.map_weight}-' \
-               f'SP-{self.args.sp_weight}'
+                f'MIP-{self.args.mip_weight}-' \
+                f'MAP-{self.args.map_weight}-' \
+                f'SP-{self.args.sp_weight}'
 
         pretrain_data_iter = tqdm.tqdm(enumerate(pretrain_dataloader),
-                                       desc=f"{self.args.model_name}-{self.args.data_name} Epoch:{epoch}",
-                                       total=len(pretrain_dataloader),
-                                       bar_format="{l_bar}{r_bar}")
+                                        desc=f"{self.args.model_name}-{self.args.data_name} Epoch:{epoch}",
+                                        total=len(pretrain_dataloader),
+                                        bar_format="{l_bar}{r_bar}")
 
         self.model.train()
         aap_loss_avg = 0.0
@@ -219,8 +219,8 @@ class PretrainTrainer(Trainer):
             "map_loss_avg": '{:.4f}'.format(map_loss_avg / num),
             "sp_loss_avg": '{:.4f}'.format(sp_loss_avg / num),
         }
-        tqdm.tqdm.write(desc)
-        tqdm.tqdm.write(str(post_fix))
+        print(desc)
+        print(str(post_fix))
         with open(self.args.log_file, 'a') as f:
             f.write(str(desc) + '\n')
             f.write(str(post_fix) + '\n')
@@ -228,9 +228,9 @@ class PretrainTrainer(Trainer):
 class FinetuneTrainer(Trainer):
 
     def __init__(self, model,
-                 train_dataloader,
-                 eval_dataloader,
-                 test_dataloader, args):
+                train_dataloader,
+                eval_dataloader,
+                test_dataloader, args):
         super(FinetuneTrainer, self).__init__(
             model,
             train_dataloader,
@@ -239,9 +239,9 @@ class FinetuneTrainer(Trainer):
         )
     def eval_analysis(self, dataloader, user_seq, args):
         rec_data_iter = tqdm.tqdm(enumerate(dataloader),
-                                  desc=f"Recommendation Test Analysis",
-                                  total=len(dataloader),
-                                  bar_format="{l_bar}{r_bar}")
+                                    desc=f"Recommendation Test Analysis",
+                                    total=len(dataloader),
+                                    bar_format="{l_bar}{r_bar}")
         #rec_data_iter = dataloader
 
         Ks = [1, 5, 10, 15, 20, 40]
@@ -282,7 +282,7 @@ class FinetuneTrainer(Trainer):
                 rating_pred = self.predict_full(recommend_output)
 
                 rating_pred = rating_pred.cpu().data.numpy().copy()
-                batch_user_index = user_ids.cpu().numpy().tolist()
+                batch_user_index = user_ids.cpu().numpy()
                 rating_pred[self.args.train_matrix[batch_user_index].toarray() > 0] = 0
 
                 batch_pred_list = np.argsort(-rating_pred, axis=1)
@@ -352,7 +352,7 @@ class FinetuneTrainer(Trainer):
             }
 
             if (epoch + 1) % self.args.log_freq == 0:
-                tqdm.tqdm.write(str(post_fix))
+                print(str(post_fix), flush=True)
 
             with open(self.args.log_file, 'a') as f:
                 f.write(str(post_fix) + '\n')
@@ -377,7 +377,7 @@ class FinetuneTrainer(Trainer):
                     rating_pred = self.predict_full(recommend_output)
 
                     rating_pred = rating_pred.cpu().data.numpy().copy()
-                    batch_user_index = user_ids.cpu().numpy().tolist()
+                    batch_user_index = user_ids.cpu().numpy()
                     rating_pred[self.args.train_matrix[batch_user_index].toarray() > 0] = 0
                     # reference: https://stackoverflow.com/a/23734295, https://stackoverflow.com/a/20104162
                     ind = np.argpartition(rating_pred, -40)[:, -40:]
@@ -631,7 +631,7 @@ class DistSAModelTrainer(Trainer):
             }
 
             if (epoch + 1) % self.args.log_freq == 0:
-                tqdm.tqdm.write(str(post_fix))
+                print(str(post_fix), flush=True)
 
             with open(self.args.log_file, 'a') as f:
                 f.write(str(post_fix) + '\n')
@@ -660,7 +660,7 @@ class DistSAModelTrainer(Trainer):
                             rating_pred = self.dist_predict_full(recommend_mean_output, recommend_cov_output)
 
                         rating_pred = rating_pred.cpu().data.numpy().copy()
-                        batch_user_index = user_ids.cpu().numpy().tolist()
+                        batch_user_index = user_ids.cpu().numpy()
                         rating_pred[self.args.train_matrix[batch_user_index].toarray() > 0] = 1e+24
                         ind = np.argpartition(rating_pred, 40)[:, :40]
                         arr_ind = rating_pred[np.arange(len(rating_pred))[:, None], ind]
@@ -724,7 +724,7 @@ class DistSAModelTrainer(Trainer):
                     rating_pred = self.dist_predict_full(recommend_mean_output, recommend_cov_output)
                 
                 rating_pred = rating_pred.cpu().data.numpy().copy()
-                batch_user_index = user_ids.cpu().numpy().tolist()
+                batch_user_index = user_ids.cpu().numpy()
                 rating_pred[self.args.train_matrix[batch_user_index].toarray() > 0] = 1e+24
 
                 batch_pred_list = np.argsort(rating_pred, axis=1)
@@ -763,6 +763,18 @@ class RelationAwareSASRecModelTrainer(Trainer):
             test_dataloader, args
         )
     
+    def get_loss_weights(self):
+        """Returns (alpha, beta), the weights applied to next_rel_pred_loss (Lintra)
+        and rel_pair_loss (Linter) respectively.
+
+        Base implementation returns the static, grid-searched hyperparameters
+        from args, matching the original MT4SR paper exactly. Subclasses (e.g.
+        DynamicRelationAwareSASRecModelTrainer) can override this to provide
+        adaptive/learned weighting for the D-MT4SR ablation, without touching
+        anything else in the training loop.
+        """
+        return self.args.rel_loss_weight, self.args.outseq_rel_loss_weight
+
     def relation_predict_full(self, seq_out):
         # [item_num hidden_size]
         test_item_emb = self.model.item_embeddings.weight
@@ -903,7 +915,7 @@ class RelationAwareSASRecModelTrainer(Trainer):
 
                 rating_pred = self.predict_full(recommend_output)
                 rating_pred = rating_pred.cpu().data.numpy().copy()
-                batch_user_index = user_ids.cpu().numpy().tolist()
+                batch_user_index = user_ids.cpu().numpy()
                 rating_pred[self.args.train_matrix[batch_user_index].toarray() > 0] = 0
 
                 batch_pred_list = np.argsort(-rating_pred, axis=1)
@@ -958,10 +970,11 @@ class RelationAwareSASRecModelTrainer(Trainer):
                 pred_loss, batch_auc = self.pred_loss(sequence_output, target_pos, target_neg)
                 next_rel_pred_loss = self.relation_loss(sequence_input, sequence_output, target_pos, target_neg, rel_seq_masks, relation_embs_all_layers[-1])
                 rel_pair_loss = self.relation_outside_seq_loss(item_rel, item_rel_pos, relation_embs_all_layers[-1])
+                alpha, beta = self.get_loss_weights()
                 #loss += self.args.rel_loss_weight * next_rel_pred_loss
                 loss = pred_loss
-                loss += self.args.rel_loss_weight * next_rel_pred_loss
-                loss += self.args.outseq_rel_loss_weight * rel_pair_loss
+                loss += alpha * next_rel_pred_loss
+                loss += beta * rel_pair_loss
                 self.optim.zero_grad()
                 loss.backward()
                 self.optim.step()
@@ -972,21 +985,23 @@ class RelationAwareSASRecModelTrainer(Trainer):
                 rel_pair_loss_avg += rel_pair_loss.item()
                 rec_avg_auc += batch_auc.item()
 
+            effective_alpha = alpha.item() if torch.is_tensor(alpha) else alpha
+            effective_beta = beta.item() if torch.is_tensor(beta) else beta
             post_fix = {
                 "epoch": epoch,
                 "rec_avg_loss": '{:.4f}'.format(rec_avg_loss / len(rec_data_iter)),
                 "rec_cur_loss": '{:.4f}'.format(rec_cur_loss),
                 "rec_avg_auc": '{:.4f}'.format(rec_avg_auc / len(rec_data_iter)),
-                "rel_loss_weight": '{:.4f}'.format(self.args.rel_loss_weight),
+                "rel_loss_weight": '{:.4f}'.format(effective_alpha),
                 "rel_pred_loss": '{:.8f}'.format(rel_pred_loss / len(rec_data_iter)),
-                "contributed_loss": '{:.8f}'.format(self.args.rel_loss_weight * rel_pred_loss / len(rec_data_iter)),
-                "rel_pair_loss_weight": '{:.4f}'.format(self.args.outseq_rel_loss_weight),
+                "contributed_loss": '{:.8f}'.format(effective_alpha * rel_pred_loss / len(rec_data_iter)),
+                "rel_pair_loss_weight": '{:.4f}'.format(effective_beta),
                 "rel_pair_loss_avg": '{:.8f}'.format(rel_pair_loss_avg / len(rec_data_iter)),
-                "rel_pair_contributed_loss": '{:.8f}'.format(self.args.outseq_rel_loss_weight * rel_pair_loss_avg / len(rec_data_iter)),
+                "rel_pair_contributed_loss": '{:.8f}'.format(effective_beta * rel_pair_loss_avg / len(rec_data_iter)),
             }
 
             if (epoch + 1) % self.args.log_freq == 0:
-                tqdm.tqdm.write(str(post_fix))
+                print(str(post_fix), flush=True)
 
             with open(self.args.log_file, 'a') as f:
                 f.write(str(post_fix) + '\n')
@@ -1012,7 +1027,7 @@ class RelationAwareSASRecModelTrainer(Trainer):
                     rating_pred = self.relation_predict_full(recommend_output)
 
                     rating_pred = rating_pred.cpu().data.numpy().copy()
-                    batch_user_index = user_ids.cpu().numpy().tolist()
+                    batch_user_index = user_ids.cpu().numpy()
                     rating_pred[self.args.train_matrix[batch_user_index].toarray() > 0] = 0
                     ind = np.argpartition(rating_pred, -40)[:, -40:]
                     arr_ind = rating_pred[np.arange(len(rating_pred))[:, None], ind]
@@ -1029,153 +1044,45 @@ class RelationAwareSASRecModelTrainer(Trainer):
                 return self.get_full_sort_score(epoch, answer_list, pred_list)
 
 
-# ================== D-MT4SR IMPROVEMENTS (Note: some changes to previous functions) =========================================================
+class DynamicRelationAwareSASRecModelTrainer(RelationAwareSASRecModelTrainer):
+    """D-MT4SR trainer.
 
-"""
-WIP: Trainer for SOTA Model. Not currently in use.
-"""
+    Reuses every loss/eval/prediction routine from RelationAwareSASRecModelTrainer
+    unchanged (pred_loss, relation_loss, relation_outside_seq_loss, eval_analysis,
+    iteration, etc.) -- the model (DynamicRelationAwareSASRecModel) already carries
+    the architectural change (dynamic relation weighting / time decay), so the only
+    thing this trainer needs to override is how the intra-/inter-sequence
+    regularization weights (alpha, beta) are computed.
 
-class SOTAModelTrainer(RelationAwareSASRecModelTrainer):
+    When args.dynamic_loss_weights is False (default), get_loss_weights() falls
+    back to the parent's static behavior, so DynamicRelationAwareSASRecModel +
+    DynamicRelationAwareSASRecModelTrainer with all D-MT4SR flags off should
+    reproduce MT4SR's original training dynamics exactly, aside from the
+    dynamic relation-weighting architecture change baked into the model itself.
+    This makes it straightforward to ablate each D-MT4SR contribution
+    (dynamic relation weighting, time decay, adaptive loss weights, popularity
+    negative sampling) independently against the RelationAwareSASRecModelTrainer
+    baseline.
     """
-    Optimized trainer for the SOTA modular model.
-    """
-    def iteration(self, epoch, dataloader, full_sort=False, train=True):
-        rec_data_iter = dataloader
-        if train:
-            self.model.train()
-            rec_avg_loss, rec_cur_loss, rec_avg_auc = 0.0, 0.0, 0.0
-            rel_pred_loss, rel_pair_loss_avg = 0.0, 0.0
 
-            for batch in rec_data_iter:
-                batch = tuple(t.to(self.device) for t in batch)
-                _, input_ids, target_pos, target_neg, _, rel_seq_masks, item_rel, item_rel_pos = batch
+    def __init__(self, model,
+                 train_dataloader,
+                 eval_dataloader,
+                 test_dataloader, args):
+        super(DynamicRelationAwareSASRecModelTrainer, self).__init__(
+            model,
+            train_dataloader,
+            eval_dataloader,
+            test_dataloader, args
+        )
 
-                # 1. Forward Pass
-                sequence_output, sequence_input, relation_embs_all_layers, _ = self.model.finetune(
-                    input_ids, rel_seq_masks[:, :, :-1, :-1]
-                )
-
-                # 2. Recommendation Loss (Next Item Prediction)
-                pred_loss, batch_auc = self.pred_loss(sequence_output, target_pos, target_neg)
-
-                # 3. In-Sequence Relation Loss (Multi-Task)
-                next_rel_pred_loss = self.relation_loss(
-                    sequence_input, sequence_output, target_pos, target_neg,
-                    rel_seq_masks, relation_embs_all_layers[-1]
-                )
-
-                # 4. FIXED: Outside-Sequence Relation Loss
-                # We pass the relationship embeddings, not the sequence output.
-                rel_pair_loss = self.relation_outside_seq_loss(item_rel, item_rel_pos, relation_embs_all_layers[-1])
-
-                # 5. Total Combined Loss
-                loss = pred_loss
-                loss += self.args.rel_loss_weight * next_rel_pred_loss
-                loss += self.args.outseq_rel_loss_weight * rel_pair_loss
-
-                self.optim.zero_grad()
-                loss.backward()
-                self.optim.step()
-
-                # Metrics calculation
-                rec_avg_loss += loss.item()
-                rec_cur_loss = loss.item()
-                rec_avg_auc += batch_auc.item()
-                rel_pred_loss += next_rel_pred_loss.item()
-                rel_pair_loss_avg += rel_pair_loss.item()
-            
-            post_fix = {
-                "epoch" : epoch,
-                "rec_avg_loss" : '{:.4f}'.format(rec_avg_loss / len(rec_data_iter)),
-                "rec_cur_loss" : '{:.4f}'.format(rec_cur_loss),
-                "rec_avg_auc" : '{:.4f}'.format(rec_avg_auc / len(rec_data_iter)),
-                "rel_pred_loss" : '{:.4f}'.format(rel_pred_loss / len(rec_data_iter)),
-                "rel_pair_loss_avg" : '{:.4f}'.format(rel_pair_loss_avg / len(rec_data_iter)),
-            }
-
-            if (epoch + 1) % self.args.log_freq == 0:
-                tqdm.tqdm.write(str(post_fix))
-            
-            with open(self.args.log_file, 'a') as f:
-                f.write(str(post_fix) + '\n')
-        
-        else:
-            self.model.eval()
-            pred_list = None
-            if full_sort:
-                answer_list = None
-                i = 0
-                for batch in rec_data_iter:
-                    batch = tuple(t.to(self.device) for t in batch)
-                    user_ids, input_ids, _, _, answers, rel_seq_masks, _, _ = batch
-
-                    recommend_output, _, _, _ = self.model.finetune(input_ids, rel_seq_masks[:, :, :-1, :-1])
-                    recommend_output = recommend_output[:, -1, :]
-
-                    rating_pred = self.relation_predict_full(recommend_output)
-                    
-                    # FIXED: Keep as NumPy array to allow Boolean Indexing
-                    rating_pred = rating_pred.cpu().data.numpy()
-
-                    batch_user_index = user_ids.cpu().numpy().tolist()
-                    rating_pred[self.args.train_matrix[batch_user_index].toarray() > 0] = 0
-
-                    ind = np.argpartition(rating_pred, -40)[:, -40:]
-                    arr_ind = rating_pred[np.arange(len(rating_pred))[:, None], ind]
-                    arr_ind_argsort = np.argsort(arr_ind)[np.arange(len(rating_pred)), ::-1]
-                    batch_pred_list = ind[np.arange(len(rating_pred))[:, None], arr_ind_argsort]
-
-                    if i == 0:
-                        pred_list = batch_pred_list
-                        answer_list = answers.cpu().data.numpy()
-                    else:
-                        pred_list = np.append(pred_list, batch_pred_list, axis=0)
-                        answer_list = np.append(answer_list, answers.cpu().data.numpy(), axis=0)
-                    i += 1
-                return self.get_full_sort_score(epoch, answer_list, pred_list)
-
-    def relation_outside_seq_loss(self, item_rel, item_rel_pos, relationship_embedding):
-        """
-        Optimized Outside-Sequence Loss with Negative Sampling.
-        Uses the original paper's logic but replaces the full catalog matmul.
-        """
-        # 1. Setup and Transformation (Symmetry Trick from paper)
-        num_rel = relationship_embedding.shape[0]
-        hidden = relationship_embedding.shape[1]
-        rel_sym = torch.bmm(relationship_embedding, relationship_embedding) # [num_rel, d, d]
-        
-        # 2. Embed the random 'query' items: [B, L, d]
-        item_rel_emb = self.model.item_embeddings(item_rel)
-        
-        # 3. Map items into relationship spaces: [B, L, num_rel, d]
-        rel_mapped = torch.einsum("ijk,hkk->ijhk", (item_rel_emb, rel_sym))
-        
-        # 4. Flatten for ranking
-        queries = rel_mapped.reshape(-1, hidden) # [Batch*SeqLen*NumRel, Hidden]
-        pos_targets = item_rel_pos.reshape(-1)    # [Batch*SeqLen*NumRel]
-        
-        # 5. Filter valid pairs (ignore padding/zeros)
-        mask = (pos_targets > 0)
-        queries = queries[mask]
-        pos_targets = pos_targets[mask]
-        
-        if queries.size(0) == 0:
-            return torch.tensor(0.0).to(self.device)
-            
-        # 6. Fetch Positive Embeddings
-        pos_embs = self.model.item_embeddings(pos_targets) # [N, d]
-        
-        # 7. Sample 100 Negative items per instance
-        num_neg = 100
-        neg_ids = torch.randint(1, self.args.item_size, (queries.size(0), num_neg)).to(self.device)
-        neg_embs = self.model.item_embeddings(neg_ids) # [N, 100, d]
-        
-        # 8. Contrastive Ranking Scores
-        pos_scores = torch.sum(queries * pos_embs, dim=-1) # [N]
-        # Batch Matrix Multiply: [N, 100, d] * [N, d, 1] -> [N, 100]
-        neg_scores = torch.bmm(neg_embs, queries.unsqueeze(-1)).squeeze(-1)
-        
-        # 9. BPR Ranking Loss
-        loss = -torch.log(torch.sigmoid(pos_scores.unsqueeze(1) - neg_scores) + 1e-24).mean()
-        
-        return loss
+    def get_loss_weights(self):
+        if getattr(self.args, 'dynamic_loss_weights', False):
+            # Learned multiplicative correction on top of the static,
+            # grid-searched hyperparameters: starts at 1.0x (log-scale
+            # parameters initialized to 0) and is optimized jointly with the
+            # rest of the model via ordinary backprop.
+            alpha = self.args.rel_loss_weight * torch.exp(self.model.log_alpha_scale)
+            beta = self.args.outseq_rel_loss_weight * torch.exp(self.model.log_beta_scale)
+            return alpha.squeeze(), beta.squeeze()
+        return super(DynamicRelationAwareSASRecModelTrainer, self).get_loss_weights()

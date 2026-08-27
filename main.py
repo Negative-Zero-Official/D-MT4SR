@@ -1,22 +1,24 @@
 # -*- coding: utf-8 -*-
+# @Time    : 2020/4/25 22:59
 
 import os
 import numpy as np
+import random
 import torch
 import argparse
-from tqdm import tqdm
 
 from torch.utils.data import DataLoader, RandomSampler, SequentialSampler
 
-from datasets import SASRecDataset, RelationAwareSASRecDataset
-from trainers import FinetuneTrainer, DistSAModelTrainer, RelationAwareSASRecModelTrainer, SOTAModelTrainer
-from seqmodels import SASRecModel, DistSAModel, DistMeanSAModel, RelationAwareSASRecModel, GNNRelationAwareSASRecModel, SOTARelationAwareRecModel
-from utils import EarlyStopping, get_user_seqs, get_item2attribute_json, check_path, set_seed, get_user_seqs_MoHRdata, scipy_to_torch_sparse
+from datasets import SASRecDataset, RelationAwareSASRecDataset, DynamicRelationAwareSASRecDataset
+from trainers import FinetuneTrainer, DistSAModelTrainer, RelationAwareSASRecModelTrainer, DynamicRelationAwareSASRecModelTrainer
+from seqmodels import SASRecModel, DistSAModel, DistMeanSAModel, RelationAwareSASRecModel, DynamicRelationAwareSASRecModel
+from utils import EarlyStopping, get_user_seqs, get_item2attribute_json, check_path, set_seed, get_user_seqs_MoHRdata, \
+        compute_item_popularity, build_popularity_sampling_probs
 
 def main():
     parser = argparse.ArgumentParser()
 
-    parser.add_argument('--data_dir', default='data/', type=str)
+    parser.add_argument('--data_dir', default='../data/', type=str)
     parser.add_argument('--output_dir', default='output/', type=str)
     parser.add_argument('--data_name', default='Beauty', type=str)
     parser.add_argument('--do_eval', action='store_true')
@@ -34,8 +36,22 @@ def main():
     parser.add_argument('--max_seq_length', default=50, type=int)
     parser.add_argument('--distance_metric', default='wasserstein', type=str)
     parser.add_argument('--pvn_weight', default=0.1, type=float)
-    parser.add_argument('--rel_loss_weight', default=0.1, type=float)
-    parser.add_argument('--outseq_rel_loss_weight', default=0.1, type=float)
+    parser.add_argument('--rel_loss_weight', default=0.0, type=float)
+    parser.add_argument('--outseq_rel_loss_weight', default=0.0, type=float)
+
+    # D-MT4SR args (model_name='DynamicRelationAwareSASRecModel'). All default to False/off,
+    # so DynamicRelationAwareSASRecModel with no flags set differs from MT4SR's
+    # RelationAwareSASRecModel only in the dynamic (context-conditioned) relation
+    # weighting baked into the encoder -- everything below is opt-in on top of that.
+    parser.add_argument('--use_time_decay', action='store_true',
+                        help="D-MT4SR: modulate relation attention weights by a learnable "
+                            "per-relationship decay over sequence-position distance")
+    parser.add_argument('--dynamic_loss_weights', action='store_true',
+                        help="D-MT4SR: learn a multiplicative correction on top of "
+                            "rel_loss_weight/outseq_rel_loss_weight instead of using them as fixed constants")
+    parser.add_argument('--popularity_neg_sampling', action='store_true',
+                        help="D-MT4SR: use popularity-aware (freq^0.75) negative sampling "
+                            "instead of uniform random sampling")
 
     # train args
     parser.add_argument("--lr", type=float, default=0.001, help="learning rate of adam")
@@ -49,10 +65,6 @@ def main():
     parser.add_argument("--adam_beta1", type=float, default=0.9, help="adam first beta value")
     parser.add_argument("--adam_beta2", type=float, default=0.999, help="adam second beta value")
     parser.add_argument("--gpu_id", type=str, default="0", help="gpu_id")
-
-    # D-MT4SR new args
-    parser.add_argument("--num_gnn_layers", type=int, default=2, help="number of GNN layers")
-    parser.add_argument("--use_gnn", action="store_true", default=True, help="Toggle GNN refinement")
 
     args = parser.parse_args()
 
@@ -68,10 +80,8 @@ def main():
 
     #user_seq, max_item, valid_rating_matrix, test_rating_matrix, num_users = \
     #    get_user_seqs(args.data_file)
-    user_seq, max_item, valid_rating_matrix, test_rating_matrix, num_users, user_seq_mask_mat_rel, relationships_ind_map, Item, adj_matrix = \
+    user_seq, max_item, valid_rating_matrix, test_rating_matrix, num_users, user_seq_mask_mat_rel, relationships_ind_map, Item = \
             get_user_seqs_MoHRdata(args.data_name)
-    
-    adj_matrix = scipy_to_torch_sparse(adj_matrix)
 
     #item2attribute, attribute_size = get_item2attribute_json(item2attribute_file)
 
@@ -82,6 +92,9 @@ def main():
 
     # save model args
     args_str = f'{args.model_name}-{args.data_name}-{args.hidden_size}-{args.num_hidden_layers}-{args.num_attention_heads}-{args.hidden_act}-{args.attention_probs_dropout_prob}-{args.hidden_dropout_prob}-{args.max_seq_length}-{args.lr}-{args.weight_decay}-{args.rel_loss_weight}-{args.ckp}'
+    if args.model_name == 'DynamicRelationAwareSASRecModel':
+        # Distinguish D-MT4SR ablation runs (which flags were on) in the log/checkpoint filename.
+        args_str += f'-timedecay{args.use_time_decay}-dynloss{args.dynamic_loss_weights}-popneg{args.popularity_neg_sampling}'
     args.log_file = os.path.join(args.output_dir, args_str + '.txt')
     print(str(args))
     with open(args.log_file, 'a') as f:
@@ -95,7 +108,19 @@ def main():
     checkpoint = args_str + '.pt'
     args.checkpoint_path = os.path.join(args.output_dir, checkpoint)
 
-    if args.model_name in ['RelationAwareSASRecModel', 'SOTARelationAwareRecModel']:
+    if args.model_name not in ('RelationAwareSASRecModel', 'DynamicRelationAwareSASRecModel'):
+        train_dataset = SASRecDataset(args, user_seq, data_type='train')
+        train_sampler = RandomSampler(train_dataset)
+        train_dataloader = DataLoader(train_dataset, sampler=train_sampler, batch_size=args.batch_size)
+
+        eval_dataset = SASRecDataset(args, user_seq, data_type='valid')
+        eval_sampler = SequentialSampler(eval_dataset)
+        #eval_dataloader = DataLoader(eval_dataset, sampler=eval_sampler, batch_size=200)
+
+        test_dataset = SASRecDataset(args, user_seq, data_type='test')
+        test_sampler = SequentialSampler(test_dataset)
+        #test_dataloader = DataLoader(test_dataset, sampler=test_sampler, batch_size=200)
+    elif args.model_name == 'RelationAwareSASRecModel':
         train_dataset = RelationAwareSASRecDataset(args, user_seq, user_seq_mask_mat_rel, relationships_ind_map, Item, data_type='train')
         train_sampler = RandomSampler(train_dataset)
         train_dataloader = DataLoader(train_dataset, sampler=train_sampler, batch_size=args.batch_size)
@@ -106,15 +131,19 @@ def main():
         test_dataset = RelationAwareSASRecDataset(args, user_seq, user_seq_mask_mat_rel, relationships_ind_map, Item, data_type='test')
         test_sampler = SequentialSampler(test_dataset)
     else:
-        train_dataset = SASRecDataset(args, user_seq, data_type='train')
+        # D-MT4SR: same relation-aware dataset as MT4SR, plus an optional
+        # popularity-aware negative sampling distribution shared across splits.
+        item_freq = compute_item_popularity(user_seq, args.item_size - 2)
+        sampling_probs = build_popularity_sampling_probs(item_freq) if args.popularity_neg_sampling else None
+
+        train_dataset = DynamicRelationAwareSASRecDataset(args, user_seq, user_seq_mask_mat_rel, relationships_ind_map, Item, data_type='train', sampling_probs=sampling_probs)
         train_sampler = RandomSampler(train_dataset)
         train_dataloader = DataLoader(train_dataset, sampler=train_sampler, batch_size=args.batch_size)
 
-        eval_dataset = SASRecDataset(args, user_seq, data_type='valid')
+        eval_dataset = DynamicRelationAwareSASRecDataset(args, user_seq, user_seq_mask_mat_rel, relationships_ind_map, Item, data_type='valid', sampling_probs=sampling_probs)
         eval_sampler = SequentialSampler(eval_dataset)
-        #eval_dataloader = DataLoader(eval_dataset, sampler=eval_sampler, batch_size=200)
 
-        test_dataset = SASRecDataset(args, user_seq, data_type='test')
+        test_dataset = DynamicRelationAwareSASRecDataset(args, user_seq, user_seq_mask_mat_rel, relationships_ind_map, Item, data_type='test', sampling_probs=sampling_probs)
         test_sampler = SequentialSampler(test_dataset)
 
 
@@ -136,24 +165,12 @@ def main():
         test_dataloader = DataLoader(test_dataset, sampler=test_sampler, batch_size=args.batch_size)
         trainer = RelationAwareSASRecModelTrainer(model, train_dataloader, eval_dataloader,
                                     test_dataloader, args)
-
-
-    # ================== D-MT4SR IMPROVEMENTS (Note: some changes to previous functions) =========================================================
-
-    elif args.model_name == 'GNNRelationAwareSASRecModel':
-        model = GNNRelationAwareSASRecModel(args, adj_matrix)
+    elif args.model_name == 'DynamicRelationAwareSASRecModel':
+        model = DynamicRelationAwareSASRecModel(args, relationships_ind_map)
         eval_dataloader = DataLoader(eval_dataset, sampler=eval_sampler, batch_size=args.batch_size)
         test_dataloader = DataLoader(test_dataset, sampler=test_sampler, batch_size=args.batch_size)
-        trainer = FinetuneTrainer(model, train_dataloader, eval_dataloader,
-                                test_dataloader, args)
-    elif args.model_name == 'SOTARelationAwareRecModel':
-        model = SOTARelationAwareRecModel(args, adj_matrix, relationships_ind_map)
-        eval_dataloader = DataLoader(eval_dataset, sampler=eval_sampler, batch_size=args.batch_size)
-        test_dataloader = DataLoader(test_dataset, sampler=test_sampler, batch_size=args.batch_size)
-        trainer = RelationAwareSASRecModelTrainer(model, train_dataloader, eval_dataloader,
-                                                test_dataloader, args)
-
-
+        trainer = DynamicRelationAwareSASRecModelTrainer(model, train_dataloader, eval_dataloader,
+                                    test_dataloader, args)
     else:
         model = SASRecModel(args=args)
         eval_dataloader = DataLoader(eval_dataset, sampler=eval_sampler, batch_size=args.batch_size)
@@ -180,21 +197,13 @@ def main():
         #    print(f'{pretrained_path} Not Found! The Model is same as SASRec')
 
         early_stopping = EarlyStopping(args.checkpoint_path, patience=50, verbose=True)
-
-        epoch_iter = tqdm(
-            range(args.epochs),
-            desc="Training",
-            unit="epoch",
-            leave=True
-        )
-
-        for epoch in epoch_iter:
+        for epoch in range(args.epochs):
             trainer.train(epoch)
             # evaluate on MRR
             scores, _, _ = trainer.valid(epoch, full_sort=True)
             early_stopping(np.array(scores[-1:]), trainer.model)
             if early_stopping.early_stop:
-                tqdm.write("Early stopping")
+                print("Early stopping")
                 break
 
         print('---------------Change to test_rating_matrix!-------------------')
