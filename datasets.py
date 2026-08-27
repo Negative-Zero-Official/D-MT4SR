@@ -57,9 +57,12 @@ class PretrainDataset(Dataset):
             neg_start_id = random.randint(0, len(self.long_sequence) - sample_length)
             pos_segment = sequence[start_id: start_id + sample_length]
             neg_segment = self.long_sequence[neg_start_id:neg_start_id + sample_length]
-            masked_segment_sequence = sequence[:start_id] + [self.args.mask_id] * sample_length + sequence[start_id + sample_length:]
-            pos_segment = [self.args.mask_id] * start_id + pos_segment + [self.args.mask_id] * (len(sequence) - (start_id + sample_length))
-            neg_segment = [self.args.mask_id] * start_id + neg_segment + [self.args.mask_id] * (len(sequence) - (start_id + sample_length))
+            masked_segment_sequence = sequence[:start_id] + [self.args.mask_id] * sample_length + sequence[
+                                                                                      start_id + sample_length:]
+            pos_segment = [self.args.mask_id] * start_id + pos_segment + [self.args.mask_id] * (
+                        len(sequence) - (start_id + sample_length))
+            neg_segment = [self.args.mask_id] * start_id + neg_segment + [self.args.mask_id] * (
+                        len(sequence) - (start_id + sample_length))
 
         assert len(masked_segment_sequence) == len(sequence)
         assert len(pos_segment) == len(sequence)
@@ -106,12 +109,12 @@ class PretrainDataset(Dataset):
 
 
         cur_tensors = (torch.tensor(attributes, dtype=torch.long),
-                        torch.tensor(masked_item_sequence, dtype=torch.long),
-                        torch.tensor(pos_items, dtype=torch.long),
-                        torch.tensor(neg_items, dtype=torch.long),
-                        torch.tensor(masked_segment_sequence, dtype=torch.long),
-                        torch.tensor(pos_segment, dtype=torch.long),
-                        torch.tensor(neg_segment, dtype=torch.long),)
+                       torch.tensor(masked_item_sequence, dtype=torch.long),
+                       torch.tensor(pos_items, dtype=torch.long),
+                       torch.tensor(neg_items, dtype=torch.long),
+                       torch.tensor(masked_segment_sequence, dtype=torch.long),
+                       torch.tensor(pos_segment, dtype=torch.long),
+                       torch.tensor(neg_segment, dtype=torch.long),)
         return cur_tensors
 
 class SASRecDataset(Dataset):
@@ -249,9 +252,13 @@ class RelationAwareSASRecDataset(Dataset):
 
         # test [0, 1, 2, 3, 4, 5]
         # answer [6]
+        # NOTE: input_slice/target_slice are equivalent to the literal slicing
+        # used before (items[:-3], items[1:-2], etc.) -- expressed as slice
+        # objects so extra_tensors() (below) can apply the exact same window to
+        # other per-position sequences (e.g. timestamps for D-MT4SR time decay).
         if self.data_type == "train":
-            input_ids = items[:-3]
-            target_pos = items[1:-2]
+            input_slice = slice(None, -3)
+            target_slice = slice(1, -2)
             answer = [0] # no use
             if acutual_seq_len - 2 <= self.max_len+1:
                 seq_mask[:, -(acutual_seq_len-2):, -(acutual_seq_len-2):] = user_seq_mask_mat[:, :-2, :-2]
@@ -260,8 +267,8 @@ class RelationAwareSASRecDataset(Dataset):
 
 
         elif self.data_type == 'valid':
-            input_ids = items[:-2]
-            target_pos = items[1:-1]
+            input_slice = slice(None, -2)
+            target_slice = slice(1, -1)
             answer = [items[-2]]
             if acutual_seq_len - 1 <= self.max_len+1:
                 seq_mask[:, -(acutual_seq_len-1):, -(acutual_seq_len-1):] = user_seq_mask_mat[:, :-1, :-1]
@@ -269,13 +276,16 @@ class RelationAwareSASRecDataset(Dataset):
                 seq_mask[:, :, :] = user_seq_mask_mat[:, -(self.max_len+1+1):-1, -(self.max_len+1+1):-1]
 
         else:
-            input_ids = items[:-1]
-            target_pos = items[1:]
+            input_slice = slice(None, -1)
+            target_slice = slice(1, None)
             answer = [items[-1]]
             if acutual_seq_len <= self.max_len+1:
                 seq_mask[:, -acutual_seq_len:, -acutual_seq_len:] = user_seq_mask_mat[:, :, :]
             else:
                 seq_mask[:, :, :] = user_seq_mask_mat[:, -(self.max_len+1):, -(self.max_len+1):]
+
+        input_ids = items[input_slice]
+        target_pos = items[target_slice]
 
         target_neg = []
         seq_set = set(items)
@@ -295,6 +305,12 @@ class RelationAwareSASRecDataset(Dataset):
         assert len(target_pos) == self.max_len
         assert len(target_neg) == self.max_len
 
+        # Hook for extra per-position tensors (e.g. D-MT4SR timestamps aligned
+        # to input_ids via the same input_slice). Default: none, so the batch
+        # structure below is byte-for-byte identical to the original MT4SR
+        # dataset unless a subclass opts in.
+        extra = self.extra_tensors(index, items, input_slice)
+
         if self.test_neg_items is not None:
             test_samples = self.test_neg_items[index]
 
@@ -308,7 +324,7 @@ class RelationAwareSASRecDataset(Dataset):
                 torch.tensor(item_rel, dtype=torch.long),
                 torch.tensor(item_rel_pos, dtype=torch.long),
                 torch.tensor(test_samples, dtype=torch.long),
-            )
+            ) + tuple(extra)
         else:
             cur_tensors = (
                 torch.tensor(user_id, dtype=torch.long),  # user_id for testing
@@ -319,7 +335,7 @@ class RelationAwareSASRecDataset(Dataset):
                 torch.tensor(seq_mask, dtype=torch.long),
                 torch.tensor(item_rel, dtype=torch.long),
                 torch.tensor(item_rel_pos, dtype=torch.long),
-            )
+            ) + tuple(extra)
 
         return cur_tensors
 
@@ -329,6 +345,13 @@ class RelationAwareSASRecDataset(Dataset):
         popularity-aware sampling."""
         return neg_sample(seq_set, self.args.item_size)
 
+    def extra_tensors(self, index, items, input_slice):
+        """Hook for appending extra per-sample tensors to the batch tuple (e.g.
+        timestamps for D-MT4SR time-decay attention). Default: no extra
+        tensors, so RelationAwareSASRecDataset's batch structure is exactly the
+        original MT4SR format. Overridden by DynamicRelationAwareSASRecDataset."""
+        return []
+
     def __len__(self):
         return len(self.user_seq)
 
@@ -337,25 +360,54 @@ class DynamicRelationAwareSASRecDataset(RelationAwareSASRecDataset):
     """D-MT4SR dataset.
 
     Identical to RelationAwareSASRecDataset (same relation masks, same
-    intra-/inter-sequence item_rel sampling) except it optionally swaps in
-    popularity-aware negative sampling (see utils.neg_sample_popularity) when
-    `args.popularity_neg_sampling` is set and a sampling distribution is
-    provided. This isolates the "dynamic negative sampling" contribution so it
-    can be toggled and compared independently of the other D-MT4SR changes
-    (dynamic relation weighting, time decay, adaptive loss weighting), which
-    live in the model/trainer instead.
+    intra-/inter-sequence item_rel sampling) except it:
+
+    1. Optionally swaps in popularity-aware negative sampling (see
+       utils.neg_sample_popularity) when `args.popularity_neg_sampling` is set
+       and a sampling distribution is provided.
+    2. Optionally appends a per-position raw-timestamp tensor (aligned to
+       input_ids) to the batch, when `user_seq_times` is available -- i.e. the
+       loaded dataset was produced by the timestamp-aware preprocess_fromscratch.py.
+       If `user_seq_times` is None (older preprocessed .npy file), an all-zero
+       sentinel tensor is returned instead so the batch shape stays constant;
+       DynamicRelationAwareSelfAttention only consults real timestamp values
+       when args.has_real_timestamps is True, so this is a safe no-op fallback
+       to the original position-distance decay proxy.
+
+    Both additions are independently toggleable and isolated from the dynamic
+    relation-weighting architecture change (which lives in the model), so each
+    D-MT4SR contribution can be compared against the RelationAwareSASRecDataset
+    baseline on its own.
     """
 
     def __init__(self, args, user_seq, relationship_mask_mat_fullseqs, relationships_ind_map, Item,
-                 test_neg_items=None, data_type='train', sampling_probs=None):
+                 test_neg_items=None, data_type='train', sampling_probs=None, user_seq_times=None):
         super(DynamicRelationAwareSASRecDataset, self).__init__(
             args, user_seq, relationship_mask_mat_fullseqs, relationships_ind_map, Item,
             test_neg_items=test_neg_items, data_type=data_type)
         # Precomputed popularity sampling distribution (see utils.build_popularity_sampling_probs).
         # None => falls back to uniform sampling, identical to the original MT4SR dataset.
         self.sampling_probs = sampling_probs
+        # Per-user raw interaction timestamps, index-aligned with user_seq (see
+        # utils.get_user_seqs_MoHRdata). None if the loaded .npy predates
+        # timestamp support -- extra_tensors() below degrades gracefully.
+        self.user_seq_times = user_seq_times
 
     def sample_negative(self, seq_set):
         if getattr(self.args, 'popularity_neg_sampling', False) and self.sampling_probs is not None:
             return neg_sample_popularity(seq_set, self.args.item_size, self.sampling_probs)
         return super(DynamicRelationAwareSASRecDataset, self).sample_negative(seq_set)
+
+    def extra_tensors(self, index, items, input_slice):
+        if self.user_seq_times is not None:
+            times = self.user_seq_times[index][input_slice]
+            pad_len = self.max_len - len(times)
+            times = [0.0] * pad_len + list(times)
+            times = times[-self.max_len:]
+        else:
+            # No real timestamps available for this run (older preprocessed
+            # file, or timestamps not requested) -- return an all-zero
+            # sentinel so the batch structure is identical either way. The
+            # model falls back to position-distance decay in this case.
+            times = [0.0] * self.max_len
+        return [torch.tensor(times, dtype=torch.float)]

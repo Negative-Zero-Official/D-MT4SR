@@ -239,7 +239,42 @@ class DynamicRelationAwareSASRecModel(RelationAwareSASRecModel):
         self.log_alpha_scale = nn.Parameter(torch.zeros(1))
         self.log_beta_scale = nn.Parameter(torch.zeros(1))
 
-    # finetune() is inherited unchanged from RelationAwareSASRecModel: it calls
-    # self.item_encoder(...) generically, and DynamicRelationAwareSAEncoder
-    # matches the same (all_encoder_layers, relation_embs_layers, extra_list)
-    # return signature, so no override is needed here.
+    # finetune() overrides RelationAwareSASRecModel's version only to thread an
+    # optional input_times tensor through to the encoder for D-MT4SR's
+    # timestamp-aware decay (see modules.DynamicRelationAwareSelfAttention).
+    # Everything else is identical to the parent's finetune().
+    def finetune(self, input_ids, input_rel_seq_masks, input_times=None):
+
+        attention_mask = (input_ids > 0).long()
+        extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2) # torch.int64
+        max_len = attention_mask.size(-1)
+        attn_shape = (1, max_len, max_len)
+        subsequent_mask = torch.triu(torch.ones(attn_shape), diagonal=1) # torch.uint8
+        subsequent_mask = (subsequent_mask == 0).unsqueeze(1)
+        subsequent_mask = subsequent_mask.long()
+
+        if self.args.cuda_condition:
+            subsequent_mask = subsequent_mask.cuda()
+            input_rel_seq_masks = input_rel_seq_masks.cuda()
+            if input_times is not None:
+                input_times = input_times.cuda()
+
+        extended_attention_mask = extended_attention_mask * subsequent_mask
+        extended_attention_mask = extended_attention_mask.to(dtype=next(self.parameters()).dtype) # fp16 compatibility
+        extended_attention_mask = (1.0 - extended_attention_mask) * -10000.0
+
+        input_rel_seq_masks = input_rel_seq_masks.to(dtype=next(self.parameters()).dtype)
+
+        if input_times is not None:
+            input_times = input_times.to(dtype=next(self.parameters()).dtype)
+
+        sequence_emb = self.add_position_embedding(input_ids)
+
+        item_encoded_layers, relation_embs_layers, relation_gates_layers = self.item_encoder(sequence_emb,
+                                                                                                extended_attention_mask,
+                                                                                                input_rel_seq_masks,
+                                                                                                input_times=input_times,
+                                                                                                output_all_encoded_layers=True)
+
+        sequence_output = item_encoded_layers[-1]
+        return sequence_output, sequence_emb, relation_embs_layers, relation_gates_layers

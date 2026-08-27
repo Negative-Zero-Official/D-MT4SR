@@ -623,16 +623,23 @@ class RelationAwareSAEncoder(nn.Module):
 # with a small gating network conditioned on the current hidden states, so the
 # relative importance of each relationship is computed per-sequence-position
 # instead of once globally. It optionally also applies a learnable per-relationship
-# decay as a function of the position gap between two items in the sequence, as
-# a practical proxy for recency/time-decay (real interaction timestamps are
-# discarded in the current preprocessing pipeline -- see preprocess_fromscratch.py
-# -- so position distance is used as the available stand-in signal).
+# decay as a function of the gap between two items in the sequence:
+#   - if real interaction timestamps are available (preprocess_fromscratch.py now
+#     saves them, and args.has_real_timestamps is set accordingly in main.py),
+#     the decay uses the actual elapsed time between the two interactions;
+#   - otherwise (older preprocessed .npy files that predate timestamp support,
+#     or --use_time_decay without regenerating the data) it automatically falls
+#     back to sequence-position distance as a practical proxy, exactly as before.
+# This fallback is decided once at construction time from args, so behavior for
+# a given run is deterministic and doesn't depend on the contents of any one
+# batch.
 #
 # Everything else (Q/K/V projections, the relationship_embedding "normal matrix"
 # trick from ANALOGY, causal masking, dropout, residual + LayerNorm) is identical
 # to RelationAwareSelfAttention, so this is a drop-in replacement with the same
-# forward() signature -- it can be swapped in via --model_name without touching
-# the rest of the pipeline.
+# core forward() signature (input_times is an optional extra arg) -- it can be
+# swapped in via --model_name without touching the rest of the pipeline, and old
+# models/data are completely unaffected.
 # ---------------------------------------------------------------------------
 
 class DynamicRelationAwareSelfAttention(RelationAwareSelfAttention):
@@ -651,16 +658,33 @@ class DynamicRelationAwareSelfAttention(RelationAwareSelfAttention):
         # access. The actual weighting comes from relation_gate instead.
 
         self.use_time_decay = getattr(args, 'use_time_decay', False)
+        # Set once per run in main.py based on whether the loaded .npy file
+        # actually contains timestamps (utils.get_user_seqs_MoHRdata). This is
+        # a static, deterministic switch -- NOT re-checked per batch -- so a
+        # given run always uses the same decay signal throughout training.
+        self.has_real_timestamps = getattr(args, 'has_real_timestamps', False)
         if self.use_time_decay:
             # One learnable decay rate per relationship. Larger rate = relation's
-            # influence falls off faster with sequence-position distance.
+            # influence falls off faster with distance (position or elapsed time).
             # Initialized small (slow decay) so the model starts close to the
             # non-decayed behavior and can learn stronger decay if useful.
             self.decay_rate = nn.Parameter(torch.ones(num_relationships) * 0.01)
+            if self.has_real_timestamps:
+                # Divides raw timestamp gaps (typically unix seconds) down to a
+                # sane scale before multiplying by decay_rate, so decay_rate
+                # stays in an easily-learnable range regardless of the dataset's
+                # time unit. Default 86400 = seconds/day, i.e. decay_rate is
+                # roughly "decay per day".
+                self.time_scale = getattr(args, 'time_scale', 86400.0)
 
-    def forward(self, input_tensor, attention_mask, input_relationships_masks):
+    def forward(self, input_tensor, attention_mask, input_relationships_masks, input_times=None):
         # relationship_embedding shape: [num_rel, d, d]
         # input_relationships_masks shape: [num_rel, L, L]
+        # input_times (optional): [B, L] raw per-position timestamps, aligned
+        # with input_tensor's sequence positions (see datasets.py extra_tensors).
+        # Only consulted when self.use_time_decay and self.has_real_timestamps
+        # are both True; otherwise ignored (position-distance decay is used, or
+        # no decay at all).
 
         mixed_query_layer = self.query(input_tensor)
         mixed_key_layer = self.key(input_tensor)
@@ -699,11 +723,21 @@ class DynamicRelationAwareSelfAttention(RelationAwareSelfAttention):
         dynamic_weights = dynamic_weights.unsqueeze(1).unsqueeze(3)  # (B, 1, L, 1, num_rel)
 
         if self.use_time_decay:
-            positions = torch.arange(seq_len, dtype=torch.float, device=input_tensor.device)
-            pos_gap = (positions.unsqueeze(1) - positions.unsqueeze(0)).abs()  # (L, L), gap between query i and key j
             decay_rate = torch.clamp(self.decay_rate, min=1e-4)  # (num_rel,), keep decay well-behaved
-            decay = torch.exp(-decay_rate.view(1, 1, -1) * pos_gap.unsqueeze(-1))  # (L, L, num_rel)
-            decay = decay.unsqueeze(0).unsqueeze(0)  # (1, 1, L, L, num_rel)
+            if self.has_real_timestamps and input_times is not None:
+                # Real elapsed-time decay: per-sample, per-position-pair gap in
+                # (typically) days, since each sample has its own timestamps.
+                time_gap = (input_times.unsqueeze(2) - input_times.unsqueeze(1)).abs() / self.time_scale  # (B, L, L)
+                decay = torch.exp(-decay_rate.view(1, 1, 1, -1) * time_gap.unsqueeze(-1))  # (B, L, L, num_rel)
+                decay = decay.unsqueeze(1)  # (B, 1, L, L, num_rel)
+            else:
+                # Fallback: sequence-position distance as a time proxy, shared
+                # across the batch (used automatically when real timestamps
+                # aren't available for this run -- see has_real_timestamps above).
+                positions = torch.arange(seq_len, dtype=torch.float, device=input_tensor.device)
+                pos_gap = (positions.unsqueeze(1) - positions.unsqueeze(0)).abs()  # (L, L)
+                decay = torch.exp(-decay_rate.view(1, 1, -1) * pos_gap.unsqueeze(-1))  # (L, L, num_rel)
+                decay = decay.unsqueeze(0).unsqueeze(0)  # (1, 1, L, L, num_rel)
             combined_weights = dynamic_weights * decay  # (B, 1, L, L, num_rel)
         else:
             combined_weights = dynamic_weights  # broadcasts over key-position dim
@@ -730,8 +764,8 @@ class DynamicRelationAwareLayer(nn.Module):
         self.attention = DynamicRelationAwareSelfAttention(args, num_relationships)
         self.intermediate = Intermediate(args)
 
-    def forward(self, hidden_states, attention_mask, input_relationships_masks):
-        attention_output = self.attention(hidden_states, attention_mask, input_relationships_masks)
+    def forward(self, hidden_states, attention_mask, input_relationships_masks, input_times=None):
+        attention_output = self.attention(hidden_states, attention_mask, input_relationships_masks, input_times=input_times)
         intermediate_output = self.intermediate(attention_output)
         return intermediate_output
 
@@ -743,13 +777,13 @@ class DynamicRelationAwareSAEncoder(nn.Module):
         self.layer = nn.ModuleList([copy.deepcopy(layer)
                                     for _ in range(args.num_hidden_layers)])
 
-    def forward(self, hidden_states, attention_mask, input_relationships_masks, output_all_encoded_layers=True):
+    def forward(self, hidden_states, attention_mask, input_relationships_masks, input_times=None, output_all_encoded_layers=True):
         all_encoder_layers = []
         relation_embs_all_layers = []
         relation_gates_all_layers = []
 
         for layer_module in self.layer:
-            hidden_states = layer_module(hidden_states, attention_mask, input_relationships_masks)
+            hidden_states = layer_module(hidden_states, attention_mask, input_relationships_masks, input_times=input_times)
             if output_all_encoded_layers:
                 all_encoder_layers.append(hidden_states)
                 relation_embs_all_layers.append(layer_module.attention.relationship_embedding)

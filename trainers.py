@@ -17,8 +17,8 @@ from modules import wasserstein_distance, kl_distance, wasserstein_distance_matm
 
 class Trainer:
     def __init__(self, model, train_dataloader,
-                eval_dataloader,
-                test_dataloader, args):
+                 eval_dataloader,
+                 test_dataloader, args):
 
         self.args = args
         self.cuda_condition = torch.cuda.is_available() and not self.args.no_cuda
@@ -159,9 +159,9 @@ class Trainer:
 class PretrainTrainer(Trainer):
 
     def __init__(self, model,
-                train_dataloader,
-                eval_dataloader,
-                test_dataloader, args):
+                 train_dataloader,
+                 eval_dataloader,
+                 test_dataloader, args):
         super(PretrainTrainer, self).__init__(
             model,
             train_dataloader,
@@ -172,14 +172,14 @@ class PretrainTrainer(Trainer):
     def pretrain(self, epoch, pretrain_dataloader):
 
         desc = f'AAP-{self.args.aap_weight}-' \
-                f'MIP-{self.args.mip_weight}-' \
-                f'MAP-{self.args.map_weight}-' \
-                f'SP-{self.args.sp_weight}'
+               f'MIP-{self.args.mip_weight}-' \
+               f'MAP-{self.args.map_weight}-' \
+               f'SP-{self.args.sp_weight}'
 
         pretrain_data_iter = tqdm.tqdm(enumerate(pretrain_dataloader),
-                                        desc=f"{self.args.model_name}-{self.args.data_name} Epoch:{epoch}",
-                                        total=len(pretrain_dataloader),
-                                        bar_format="{l_bar}{r_bar}")
+                                       desc=f"{self.args.model_name}-{self.args.data_name} Epoch:{epoch}",
+                                       total=len(pretrain_dataloader),
+                                       bar_format="{l_bar}{r_bar}")
 
         self.model.train()
         aap_loss_avg = 0.0
@@ -228,9 +228,9 @@ class PretrainTrainer(Trainer):
 class FinetuneTrainer(Trainer):
 
     def __init__(self, model,
-                train_dataloader,
-                eval_dataloader,
-                test_dataloader, args):
+                 train_dataloader,
+                 eval_dataloader,
+                 test_dataloader, args):
         super(FinetuneTrainer, self).__init__(
             model,
             train_dataloader,
@@ -239,9 +239,9 @@ class FinetuneTrainer(Trainer):
         )
     def eval_analysis(self, dataloader, user_seq, args):
         rec_data_iter = tqdm.tqdm(enumerate(dataloader),
-                                    desc=f"Recommendation Test Analysis",
-                                    total=len(dataloader),
-                                    bar_format="{l_bar}{r_bar}")
+                                  desc=f"Recommendation Test Analysis",
+                                  total=len(dataloader),
+                                  bar_format="{l_bar}{r_bar}")
         #rec_data_iter = dataloader
 
         Ks = [1, 5, 10, 15, 20, 40]
@@ -1086,3 +1086,170 @@ class DynamicRelationAwareSASRecModelTrainer(RelationAwareSASRecModelTrainer):
             beta = self.args.outseq_rel_loss_weight * torch.exp(self.model.log_beta_scale)
             return alpha.squeeze(), beta.squeeze()
         return super(DynamicRelationAwareSASRecModelTrainer, self).get_loss_weights()
+
+    # eval_analysis() and iteration() below are full overrides (not just calls
+    # to super()) because DynamicRelationAwareSASRecDataset's batch tuple has
+    # one extra tensor (input_times) appended after item_rel_pos -- see
+    # datasets.py extra_tensors(). Everything else (loss functions, metrics,
+    # eval bookkeeping) is identical to RelationAwareSASRecModelTrainer; only
+    # the batch-unpacking line and the finetune() call (which now passes
+    # input_times=input_times) differ from the parent implementation.
+
+    def eval_analysis(self, dataloader, user_seq, args):
+        rec_data_iter = tqdm.tqdm(enumerate(dataloader),
+                                  desc=f"Recommendation Test Analysis",
+                                  total=len(dataloader),
+                                  bar_format="{l_bar}{r_bar}")
+
+        Ks = [1, 5, 10, 15, 20, 40]
+        item_freq = defaultdict(int)
+        train = {}
+        for user_id, seq in enumerate(user_seq):
+            train_seq = seq[:-2]
+            train[user_id] = train_seq
+            for itemid in train_seq:
+                item_freq[itemid] += 1
+        freq_quantiles = np.array([3, 7, 20, 50])
+        items_in_freqintervals = [[] for _ in range(len(freq_quantiles)+1)]
+        for item, freq_i in item_freq.items():
+            interval_ind = -1
+            for quant_ind, quant_freq in enumerate(freq_quantiles):
+                if freq_i <= quant_freq:
+                    interval_ind = quant_ind
+                    break
+            if interval_ind == -1:
+                interval_ind = len(items_in_freqintervals) - 1
+            items_in_freqintervals[interval_ind].append(item)
+
+
+        self.model.eval()
+        all_pos_items_ranks = defaultdict(list)
+        pred_list = None
+        with torch.no_grad():
+            for i, batch in rec_data_iter:
+                # 0. batch_data will be sent into the device(GPU or cpu)
+                batch = tuple(t.to(self.device) for t in batch)
+                user_ids, input_ids, target_pos, target_neg, answers, rel_seq_masks, item_rel, item_rel_pos, input_times = batch
+                recommend_output, sequence_input, relation_embs_all_layers, relation_gates_all_layers = self.model.finetune(
+                    input_ids, rel_seq_masks[:, :, :-1, :-1], input_times=input_times)
+
+                recommend_output = recommend_output[:, -1, :]
+
+                rating_pred = self.predict_full(recommend_output)
+                rating_pred = rating_pred.cpu().data.numpy().copy()
+                batch_user_index = user_ids.cpu().numpy()
+                rating_pred[self.args.train_matrix[batch_user_index].toarray() > 0] = 0
+
+                batch_pred_list = np.argsort(-rating_pred, axis=1)
+                pos_items = answers.cpu().data.numpy()
+
+                pos_ranks = np.where(batch_pred_list==pos_items)[1]+1
+                for each_pos_item, each_rank in zip(pos_items, pos_ranks):
+                    all_pos_items_ranks[each_pos_item[0]].append(each_rank)
+
+                partial_batch_pred_list = batch_pred_list[:, :40]
+
+                if i == 0:
+                    pred_list = partial_batch_pred_list
+                    answer_list = answers.cpu().data.numpy()
+                else:
+                    pred_list = np.append(pred_list, partial_batch_pred_list, axis=0)
+                    answer_list = np.append(answer_list, answers.cpu().data.numpy(), axis=0)
+            scores, result_info, [recall_dict_list, ndcg_dict_list, mrr_dict] = self.get_full_sort_score('best', answer_list, pred_list)
+
+            get_user_performance_perpopularity(train, [recall_dict_list, ndcg_dict_list, mrr_dict], Ks)
+            get_item_performance_perpopularity(items_in_freqintervals, all_pos_items_ranks, Ks, freq_quantiles, args.item_size)
+            return scores, result_info, None
+
+    def iteration(self, epoch, dataloader, full_sort=False, train=True):
+
+        str_code = "train" if train else "test"
+        rec_data_iter = dataloader
+        if train:
+            torch.autograd.set_detect_anomaly(True)
+            self.model.train()
+            rec_avg_loss = 0.0
+            rec_cur_loss = 0.0
+            rec_avg_auc = 0.0
+            rel_pred_loss = 0.0
+            rel_pair_loss_avg = 0.0
+            for batch in rec_data_iter:
+                # 0. batch_data will be sent into the device(GPU or CPU)
+                batch = tuple(t.to(self.device) for t in batch)
+                _, input_ids, target_pos, target_neg, _, rel_seq_masks, item_rel, item_rel_pos, input_times = batch
+                # forward and loss cal
+                sequence_output, sequence_input, relation_embs_all_layers, relation_gates_all_layers = self.model.finetune(
+                    input_ids, rel_seq_masks[:, :, :-1, :-1], input_times=input_times)
+                pred_loss, batch_auc = self.pred_loss(sequence_output, target_pos, target_neg)
+                next_rel_pred_loss = self.relation_loss(sequence_input, sequence_output, target_pos, target_neg, rel_seq_masks, relation_embs_all_layers[-1])
+                rel_pair_loss = self.relation_outside_seq_loss(item_rel, item_rel_pos, relation_embs_all_layers[-1])
+                alpha, beta = self.get_loss_weights()
+                loss = pred_loss
+                loss += alpha * next_rel_pred_loss
+                loss += beta * rel_pair_loss
+                self.optim.zero_grad()
+                loss.backward()
+                self.optim.step()
+
+                rec_avg_loss += loss.item()
+                rec_cur_loss = loss.item()
+                rel_pred_loss += next_rel_pred_loss.item()
+                rel_pair_loss_avg += rel_pair_loss.item()
+                rec_avg_auc += batch_auc.item()
+
+            effective_alpha = alpha.item() if torch.is_tensor(alpha) else alpha
+            effective_beta = beta.item() if torch.is_tensor(beta) else beta
+            post_fix = {
+                "epoch": epoch,
+                "rec_avg_loss": '{:.4f}'.format(rec_avg_loss / len(rec_data_iter)),
+                "rec_cur_loss": '{:.4f}'.format(rec_cur_loss),
+                "rec_avg_auc": '{:.4f}'.format(rec_avg_auc / len(rec_data_iter)),
+                "rel_loss_weight": '{:.4f}'.format(effective_alpha),
+                "rel_pred_loss": '{:.8f}'.format(rel_pred_loss / len(rec_data_iter)),
+                "contributed_loss": '{:.8f}'.format(effective_alpha * rel_pred_loss / len(rec_data_iter)),
+                "rel_pair_loss_weight": '{:.4f}'.format(effective_beta),
+                "rel_pair_loss_avg": '{:.8f}'.format(rel_pair_loss_avg / len(rec_data_iter)),
+                "rel_pair_contributed_loss": '{:.8f}'.format(effective_beta * rel_pair_loss_avg / len(rec_data_iter)),
+                "has_real_timestamps": getattr(self.args, 'has_real_timestamps', False),
+            }
+
+            if (epoch + 1) % self.args.log_freq == 0:
+                print(str(post_fix), flush=True)
+
+            with open(self.args.log_file, 'a') as f:
+                f.write(str(post_fix) + '\n')
+        else:
+            self.model.eval()
+
+            pred_list = None
+
+            if full_sort:
+                answer_list = None
+                i = 0
+                for batch in rec_data_iter:
+                    # 0. batch_data will be sent into the device(GPU or cpu)
+                    batch = tuple(t.to(self.device) for t in batch)
+                    user_ids, input_ids, target_pos, target_neg, answers, rel_seq_masks, _, _, input_times = batch
+                    recommend_output, _, relation_embs_all_layers, relation_gates_all_layers = self.model.finetune(
+                        input_ids, rel_seq_masks[:, :, :-1, :-1], input_times=input_times)
+
+                    recommend_output = recommend_output[:, -1, :]
+
+                    rating_pred = self.relation_predict_full(recommend_output)
+
+                    rating_pred = rating_pred.cpu().data.numpy().copy()
+                    batch_user_index = user_ids.cpu().numpy()
+                    rating_pred[self.args.train_matrix[batch_user_index].toarray() > 0] = 0
+                    ind = np.argpartition(rating_pred, -40)[:, -40:]
+                    arr_ind = rating_pred[np.arange(len(rating_pred))[:, None], ind]
+                    arr_ind_argsort = np.argsort(arr_ind)[np.arange(len(rating_pred)), ::-1]
+                    batch_pred_list = ind[np.arange(len(rating_pred))[:, None], arr_ind_argsort]
+
+                    if i == 0:
+                        pred_list = batch_pred_list
+                        answer_list = answers.cpu().data.numpy()
+                    else:
+                        pred_list = np.append(pred_list, batch_pred_list, axis=0)
+                        answer_list = np.append(answer_list, answers.cpu().data.numpy(), axis=0)
+                    i += 1
+                return self.get_full_sort_score(epoch, answer_list, pred_list)

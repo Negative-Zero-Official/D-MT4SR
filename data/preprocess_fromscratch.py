@@ -7,9 +7,9 @@ import json
 import numpy as np
 
 def parse(path):
-    g = gzip.open(path, 'r')
-    for l in g:
-        yield eval(l)
+  g = gzip.open(path, 'r')
+  for l in g:
+      yield eval(l)
 
 
 DATASET = 'Office_Products'
@@ -86,18 +86,32 @@ with gzip.open(meta_path, 'r') as f:
 user_train = {}
 user_validation = {}
 user_testing = {}
+# D-MT4SR: parallel raw-timestamp sequences, index-aligned with user_train/
+# user_validation/user_testing above (same append order, same slicing), so
+# downstream code can pair each item with the timestamp of its interaction.
+user_train_times = {}
+user_validation_times = {}
+user_testing_times = {}
 for user in User:
     nfeedback = len(User[user])
     if nfeedback < 3:
         user_train[user] = [itemid for itemid, time in User[user]]
+        user_train_times[user] = [time for itemid, time in User[user]]
         user_validation[user] = []
+        user_validation_times[user] = []
         user_testing[user] = []
+        user_testing_times[user] = []
     else:
         user_train[user] = [itemid for itemid, time in User[user][:-2]]
+        user_train_times[user] = [time for itemid, time in User[user][:-2]]
         user_validation[user] = []
         user_validation[user].append(User[user][-2][0])
+        user_validation_times[user] = []
+        user_validation_times[user].append(User[user][-2][1])
         user_testing[user] = []
         user_testing[user].append(User[user][-1][0])
+        user_testing_times[user] = []
+        user_testing_times[user].append(User[user][-1][1])
 
 
 
@@ -135,7 +149,14 @@ for user in user_train.keys():
 #for u, ituple in user_testing.items():
 #    if len(ituple) > 0:
 #        user_test[u] = [ituple[1]]
-new_dataset = [user_train, user_validation, user_testing, Item, Item_relationship_mask_mat_completeseqs, relationships_ind_map, usernum, itemnum]
+# D-MT4SR: the three *_times dicts are appended at the END of the saved list
+# (indices 8-10) rather than interleaved with the original 8 fields, so that
+# any code (or previously-saved .npy files) expecting the original 8-element
+# format keeps working unchanged. utils.get_user_seqs_MoHRdata() detects which
+# format it's loading via len(dataset) and falls back gracefully to
+# position-distance decay when timestamps aren't present.
+new_dataset = [user_train, user_validation, user_testing, Item, Item_relationship_mask_mat_completeseqs, relationships_ind_map, usernum, itemnum,
+               user_train_times, user_validation_times, user_testing_times]
 np.save('./'+DATASET+'Partitioned_5core', new_dataset)
 
 

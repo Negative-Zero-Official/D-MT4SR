@@ -150,22 +150,50 @@ def get_user_seqs(data_file):
 
 def get_user_seqs_MoHRdata(dataset):
     dataset = np.load('../data/'+dataset+'Partitioned_5core.npy', allow_pickle=True)
-    [user_train, user_validation, user_test, Item, Item_relationship_mask_mat_completeseqs, relationships_ind, usernum, itemnum] = dataset
+
+    # D-MT4SR: preprocess_fromscratch.py now appends three extra timestamp dicts
+    # (user_train_times, user_validation_times, user_testing_times) after the
+    # original 8 fields. Detect which format is loaded so this function keeps
+    # working unchanged on .npy files generated before this change.
+    has_times = len(dataset) >= 11
+    if has_times:
+        [user_train, user_validation, user_test, Item, Item_relationship_mask_mat_completeseqs, relationships_ind, usernum, itemnum,
+         user_train_times, user_validation_times, user_testing_times] = dataset[:11]
+    else:
+        [user_train, user_validation, user_test, Item, Item_relationship_mask_mat_completeseqs, relationships_ind, usernum, itemnum] = dataset[:8]
+        user_train_times = user_validation_times = user_testing_times = None
 
     user_seq = []
     user_seq_mask_mat_rel = []
+    # user_seq_times mirrors user_seq exactly (same per-user length, same order)
+    # when timestamps are available; None otherwise, signalling downstream code
+    # (DynamicRelationAwareSASRecDataset / DynamicRelationAwareSelfAttention) to
+    # fall back to its position-distance decay proxy.
+    user_seq_times = [] if has_times else None
     for uid in user_train.keys():
         seq = [itemid+1 for itemid in user_train[uid]]
+        if has_times:
+            seq_times = list(user_train_times[uid])
         if len(user_validation) == 2:
             seq.append(user_validation[uid][1]+1)
+            if has_times:
+                seq_times.append(user_validation_times[uid][1])
         else:
             seq.append(user_validation[uid][0]+1)
+            if has_times:
+                seq_times.append(user_validation_times[uid][0])
         if len(user_test) == 2:
             seq.append(user_test[uid][1]+1)
+            if has_times:
+                seq_times.append(user_testing_times[uid][1])
         else:
             seq.append(user_test[uid][0]+1)
+            if has_times:
+                seq_times.append(user_testing_times[uid][0])
         user_seq.append(seq)
         user_seq_mask_mat_rel.append(Item_relationship_mask_mat_completeseqs[uid])
+        if has_times:
+            user_seq_times.append(seq_times)
     num_users = usernum
     max_item = itemnum - 1
     num_items = max_item + 2
@@ -182,7 +210,7 @@ def get_user_seqs_MoHRdata(dataset):
 
     valid_rating_matrix = generate_rating_matrix_valid(user_seq, num_users, num_items)
     test_rating_matrix = generate_rating_matrix_test(user_seq, num_users, num_items)
-    return user_seq, max_item, valid_rating_matrix, test_rating_matrix, num_users, user_seq_mask_mat_rel, relationships_ind, new_Item
+    return user_seq, max_item, valid_rating_matrix, test_rating_matrix, num_users, user_seq_mask_mat_rel, relationships_ind, new_Item, user_seq_times
 
 def get_user_seqs_long(data_file):
     lines = open(data_file).readlines()
@@ -311,7 +339,7 @@ def apk(actual, predicted, k=10):
     Parameters
     ----------
     actual : list
-                A list of elements that are to be predicted (order doesn't matter)
+             A list of elements that are to be predicted (order doesn't matter)
     predicted : list
                 A list of predicted elements (order does matter)
     k : int, optional
@@ -346,8 +374,8 @@ def mapk(actual, predicted, k=10):
     Parameters
     ----------
     actual : list
-                A list of lists of elements that are to be predicted
-                (order doesn't matter in the lists)
+             A list of lists of elements that are to be predicted
+             (order doesn't matter in the lists)
     predicted : list
                 A list of lists of predicted elements
                 (order matters in the lists)
@@ -366,7 +394,8 @@ def ndcg_k(actual, predicted, topk):
     for user_id in range(len(actual)):
         k = min(topk, len(actual[user_id]))
         idcg = idcg_k(k)
-        dcg_k = sum([int(predicted[user_id][j] in set(actual[user_id])) / math.log(j+2, 2) for j in range(topk)])
+        dcg_k = sum([int(predicted[user_id][j] in
+                         set(actual[user_id])) / math.log(j+2, 2) for j in range(topk)])
         res += dcg_k / idcg
         ndcg_dict[user_id] = dcg_k / idcg
     return res / float(len(actual)), ndcg_dict

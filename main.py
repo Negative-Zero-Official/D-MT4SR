@@ -45,13 +45,17 @@ def main():
     # weighting baked into the encoder -- everything below is opt-in on top of that.
     parser.add_argument('--use_time_decay', action='store_true',
                         help="D-MT4SR: modulate relation attention weights by a learnable "
-                            "per-relationship decay over sequence-position distance")
+                             "per-relationship decay over sequence-position distance")
     parser.add_argument('--dynamic_loss_weights', action='store_true',
                         help="D-MT4SR: learn a multiplicative correction on top of "
-                            "rel_loss_weight/outseq_rel_loss_weight instead of using them as fixed constants")
+                             "rel_loss_weight/outseq_rel_loss_weight instead of using them as fixed constants")
     parser.add_argument('--popularity_neg_sampling', action='store_true',
                         help="D-MT4SR: use popularity-aware (freq^0.75) negative sampling "
-                            "instead of uniform random sampling")
+                             "instead of uniform random sampling")
+    parser.add_argument('--time_scale', default=86400.0, type=float,
+                        help="D-MT4SR: normalization divisor applied to raw timestamp gaps "
+                             "(only used when --use_time_decay and real timestamps are available; "
+                             "default 86400 = seconds/day)")
 
     # train args
     parser.add_argument("--lr", type=float, default=0.001, help="learning rate of adam")
@@ -80,7 +84,7 @@ def main():
 
     #user_seq, max_item, valid_rating_matrix, test_rating_matrix, num_users = \
     #    get_user_seqs(args.data_file)
-    user_seq, max_item, valid_rating_matrix, test_rating_matrix, num_users, user_seq_mask_mat_rel, relationships_ind_map, Item = \
+    user_seq, max_item, valid_rating_matrix, test_rating_matrix, num_users, user_seq_mask_mat_rel, relationships_ind_map, Item, user_seq_times = \
             get_user_seqs_MoHRdata(args.data_name)
 
     #item2attribute, attribute_size = get_item2attribute_json(item2attribute_file)
@@ -89,12 +93,20 @@ def main():
     args.num_users = num_users
     args.mask_id = max_item + 1
     #args.attribute_size = attribute_size + 1
+    # D-MT4SR: True only if the preprocessed .npy actually carries real
+    # per-interaction timestamps (see preprocess_fromscratch.py /
+    # utils.get_user_seqs_MoHRdata). Older preprocessed files -- and the
+    # SASRecDataset/RelationAwareSASRecDataset code paths, which never look at
+    # this flag -- are completely unaffected either way.
+    args.has_real_timestamps = user_seq_times is not None
 
     # save model args
     args_str = f'{args.model_name}-{args.data_name}-{args.hidden_size}-{args.num_hidden_layers}-{args.num_attention_heads}-{args.hidden_act}-{args.attention_probs_dropout_prob}-{args.hidden_dropout_prob}-{args.max_seq_length}-{args.lr}-{args.weight_decay}-{args.rel_loss_weight}-{args.ckp}'
     if args.model_name == 'DynamicRelationAwareSASRecModel':
-        # Distinguish D-MT4SR ablation runs (which flags were on) in the log/checkpoint filename.
-        args_str += f'-timedecay{args.use_time_decay}-dynloss{args.dynamic_loss_weights}-popneg{args.popularity_neg_sampling}'
+        # Distinguish D-MT4SR ablation runs (which flags were on, and whether
+        # this run's preprocessed data actually carried real timestamps) in
+        # the log/checkpoint filename.
+        args_str += f'-timedecay{args.use_time_decay}-realtimes{args.has_real_timestamps}-dynloss{args.dynamic_loss_weights}-popneg{args.popularity_neg_sampling}'
     args.log_file = os.path.join(args.output_dir, args_str + '.txt')
     print(str(args))
     with open(args.log_file, 'a') as f:
@@ -132,18 +144,20 @@ def main():
         test_sampler = SequentialSampler(test_dataset)
     else:
         # D-MT4SR: same relation-aware dataset as MT4SR, plus an optional
-        # popularity-aware negative sampling distribution shared across splits.
+        # popularity-aware negative sampling distribution and (if this run's
+        # preprocessed data includes them) real per-interaction timestamps,
+        # shared across splits.
         item_freq = compute_item_popularity(user_seq, args.item_size - 2)
         sampling_probs = build_popularity_sampling_probs(item_freq) if args.popularity_neg_sampling else None
 
-        train_dataset = DynamicRelationAwareSASRecDataset(args, user_seq, user_seq_mask_mat_rel, relationships_ind_map, Item, data_type='train', sampling_probs=sampling_probs)
+        train_dataset = DynamicRelationAwareSASRecDataset(args, user_seq, user_seq_mask_mat_rel, relationships_ind_map, Item, data_type='train', sampling_probs=sampling_probs, user_seq_times=user_seq_times)
         train_sampler = RandomSampler(train_dataset)
         train_dataloader = DataLoader(train_dataset, sampler=train_sampler, batch_size=args.batch_size)
 
-        eval_dataset = DynamicRelationAwareSASRecDataset(args, user_seq, user_seq_mask_mat_rel, relationships_ind_map, Item, data_type='valid', sampling_probs=sampling_probs)
+        eval_dataset = DynamicRelationAwareSASRecDataset(args, user_seq, user_seq_mask_mat_rel, relationships_ind_map, Item, data_type='valid', sampling_probs=sampling_probs, user_seq_times=user_seq_times)
         eval_sampler = SequentialSampler(eval_dataset)
 
-        test_dataset = DynamicRelationAwareSASRecDataset(args, user_seq, user_seq_mask_mat_rel, relationships_ind_map, Item, data_type='test', sampling_probs=sampling_probs)
+        test_dataset = DynamicRelationAwareSASRecDataset(args, user_seq, user_seq_mask_mat_rel, relationships_ind_map, Item, data_type='test', sampling_probs=sampling_probs, user_seq_times=user_seq_times)
         test_sampler = SequentialSampler(test_dataset)
 
 
