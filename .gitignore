@@ -1,3 +1,5 @@
 *.pyc
 *.gz
 *.npy
+dmt4sr*/
+relationsasrec_v6/

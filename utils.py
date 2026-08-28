@@ -149,7 +149,7 @@ def get_user_seqs(data_file):
     return user_seq, max_item, valid_rating_matrix, test_rating_matrix, num_users
 
 def get_user_seqs_MoHRdata(dataset):
-    dataset = np.load('../data/'+dataset+'Partitioned_5core.npy', allow_pickle=True)
+    dataset = np.load('./data/'+dataset+'Partitioned_5core.npy', allow_pickle=True)
 
     # D-MT4SR: preprocess_fromscratch.py now appends three extra timestamp dicts
     # (user_train_times, user_validation_times, user_testing_times) after the
@@ -322,7 +322,7 @@ def cal_mrr(actual, predicted):
         r = np.array(r)
         if np.sum(r) > 0:
             #sum_mrr += np.reciprocal(np.where(r==1)[0]+1, dtype=np.float)[0]
-            one_user_mrr = np.reciprocal(np.where(r==1)[0]+1, dtype=np.float)[0]
+            one_user_mrr = np.reciprocal(np.where(r==1)[0]+1, dtype=float)[0]
             sum_mrr += one_user_mrr
             true_users += 1
             mrr_dict[i] = one_user_mrr
