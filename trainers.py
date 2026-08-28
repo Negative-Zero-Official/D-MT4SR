@@ -1212,6 +1212,18 @@ class DynamicRelationAwareSASRecModelTrainer(RelationAwareSASRecModelTrainer):
                 "rel_pair_contributed_loss": '{:.8f}'.format(effective_beta * rel_pair_loss_avg / len(rec_data_iter)),
                 "has_real_timestamps": getattr(self.args, 'has_real_timestamps', False),
             }
+            if getattr(self.args, 'use_time_decay', False):
+                # Diagnostic: expose the learned per-relationship decay_rate
+                # (per layer) so it's possible to see from the log alone
+                # whether decay has collapsed the relation signal (values
+                # much above ~1/time_scale mean most pairs are near the
+                # decay floor) rather than only inferring it indirectly from
+                # downstream metrics.
+                post_fix["decay_rate_per_layer"] = [
+                    [round(v, 6) for v in layer.attention.decay_rate.detach().cpu().tolist()]
+                    for layer in self.model.item_encoder.layer
+                ]
+                post_fix["time_decay_floor"] = getattr(self.model.item_encoder.layer[0].attention, 'time_decay_floor', None)
 
             if (epoch + 1) % self.args.log_freq == 0:
                 print(str(post_fix), flush=True)

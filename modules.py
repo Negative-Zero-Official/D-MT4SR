@@ -668,7 +668,27 @@ class DynamicRelationAwareSelfAttention(RelationAwareSelfAttention):
             # influence falls off faster with distance (position or elapsed time).
             # Initialized small (slow decay) so the model starts close to the
             # non-decayed behavior and can learn stronger decay if useful.
+            #
+            # CALIBRATION WARNING: for sparse/infrequent-purchase categories
+            # (e.g. Amazon Beauty), consecutive interactions can be months or
+            # years apart. With the default time_scale (86400 = 1 day),
+            # decay_rate=0.01 already suppresses ~87% of the relation signal
+            # for a 200-day gap AT INITIALIZATION -- before training has a
+            # chance to correct it. If a run trains for many more epochs than
+            # its no-decay counterpart and underperforms, check the logged
+            # decay_rate values (see trainers.DynamicRelationAwareSASRecModelTrainer);
+            # near-zero decayed weights mean the relation signal has
+            # effectively collapsed. Consider a larger --time_scale (e.g. a
+            # month/year) for sparse categories.
             self.decay_rate = nn.Parameter(torch.ones(num_relationships) * 0.01)
+            # Floor on the decay multiplier: even at maximum learned decay, at
+            # least this fraction of the relation attention signal survives.
+            # This bounds the worst case above -- decay_rate can still be
+            # driven arbitrarily large by gradient descent, but it can no
+            # longer fully zero out the relation pathway for distant pairs,
+            # which is what caused HIT@5 to collapse (0.44 -> 0.27) in an
+            # earlier ablation on All_Beauty. Default 0.1 keeps a floor of 10%.
+            self.time_decay_floor = getattr(args, 'time_decay_floor', 0.1)
             if self.has_real_timestamps:
                 # Divides raw timestamp gaps (typically unix seconds) down to a
                 # sane scale before multiplying by decay_rate, so decay_rate
@@ -724,11 +744,19 @@ class DynamicRelationAwareSelfAttention(RelationAwareSelfAttention):
 
         if self.use_time_decay:
             decay_rate = torch.clamp(self.decay_rate, min=1e-4)  # (num_rel,), keep decay well-behaved
+            floor = self.time_decay_floor
             if self.has_real_timestamps and input_times is not None:
                 # Real elapsed-time decay: per-sample, per-position-pair gap in
                 # (typically) days, since each sample has its own timestamps.
                 time_gap = (input_times.unsqueeze(2) - input_times.unsqueeze(1)).abs() / self.time_scale  # (B, L, L)
-                decay = torch.exp(-decay_rate.view(1, 1, 1, -1) * time_gap.unsqueeze(-1))  # (B, L, L, num_rel)
+                raw_decay = torch.exp(-decay_rate.view(1, 1, 1, -1) * time_gap.unsqueeze(-1))  # (B, L, L, num_rel)
+                # Floor: even for maximally-distant/old pairs, at least `floor`
+                # of the relation signal survives, so a miscalibrated
+                # time_scale/decay_rate can slow the model down but can't
+                # fully zero out the relation pathway (see the warning in
+                # __init__ -- this is what fixed the HIT@5 collapse observed
+                # with real-timestamp decay on a sparse category).
+                decay = floor + (1.0 - floor) * raw_decay
                 decay = decay.unsqueeze(1)  # (B, 1, L, L, num_rel)
             else:
                 # Fallback: sequence-position distance as a time proxy, shared
@@ -736,7 +764,8 @@ class DynamicRelationAwareSelfAttention(RelationAwareSelfAttention):
                 # aren't available for this run -- see has_real_timestamps above).
                 positions = torch.arange(seq_len, dtype=torch.float, device=input_tensor.device)
                 pos_gap = (positions.unsqueeze(1) - positions.unsqueeze(0)).abs()  # (L, L)
-                decay = torch.exp(-decay_rate.view(1, 1, -1) * pos_gap.unsqueeze(-1))  # (L, L, num_rel)
+                raw_decay = torch.exp(-decay_rate.view(1, 1, -1) * pos_gap.unsqueeze(-1))  # (L, L, num_rel)
+                decay = floor + (1.0 - floor) * raw_decay
                 decay = decay.unsqueeze(0).unsqueeze(0)  # (1, 1, L, L, num_rel)
             combined_weights = dynamic_weights * decay  # (B, 1, L, L, num_rel)
         else:

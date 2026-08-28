@@ -56,6 +56,12 @@ def main():
                         help="D-MT4SR: normalization divisor applied to raw timestamp gaps "
                              "(only used when --use_time_decay and real timestamps are available; "
                              "default 86400 = seconds/day)")
+    parser.add_argument('--time_decay_floor', default=0.1, type=float,
+                        help="D-MT4SR: minimum fraction of the relation attention signal that "
+                             "survives even for maximally distant/old item pairs (only used with "
+                             "--use_time_decay). Prevents the learned decay from fully collapsing "
+                             "the relation signal on sparse datasets where interactions are far "
+                             "apart in time or position. 0.0 disables the floor (original behavior).")
 
     # train args
     parser.add_argument("--lr", type=float, default=0.001, help="learning rate of adam")
