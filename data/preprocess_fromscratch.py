@@ -12,7 +12,7 @@ def parse(path):
         yield json.loads(l)
 
 
-DATASET = 'Office_Products'
+DATASET = 'All_Beauty'
 # Amazon Reviews 2018 v2 (jmcauley.ucsd.edu/data/amazon_v2/) filenames -- put
 # the downloaded .json.gz files in the same directory as this script (or
 # change these paths). Either the raw per-category reviews file
@@ -21,6 +21,22 @@ DATASET = 'Office_Products'
 # (countU[rev] < 5) re-applies the filter itself either way.
 dataname = './data/' + DATASET + '.json.gz'
 meta_path = './data/meta_' + DATASET + '.json.gz'
+
+def load_metadata_asins(path):
+    asins = set()
+    
+    with gzip.open(path, 'rt', encoding='utf-8') as file:
+        for line in file:
+            metadata = json.loads(line)
+            asin = metadata.get('asin')
+        
+            if asin:
+                asins.add(asin)
+    
+    return asins
+
+metadata_asins = load_metadata_asins(meta_path)
+
 if not os.path.isdir('./'+DATASET):
     os.mkdir('./'+DATASET)
 train_file = './'+DATASET+'/train.txt'
@@ -34,6 +50,10 @@ for one_interaction in parse(dataname):
     rev = one_interaction['reviewerID']
     asin = one_interaction['asin']
     time = float(one_interaction['unixReviewTime'])
+    
+    if asin not in metadata_asins:
+        continue
+    
     countU[rev] += 1
     countP[asin] += 1
 
@@ -48,6 +68,10 @@ for one_interaction in parse(dataname):
     rev = one_interaction['reviewerID']
     asin = one_interaction['asin']
     time = float(one_interaction['unixReviewTime'])
+    
+    if asin not in metadata_asins:
+        continue
+    
     if countU[rev] < 5:
         continue
 
@@ -85,7 +109,7 @@ r_ind = 0
 RELATION_FIELDS = ['also_buy', 'also_view']
 with gzip.open(meta_path, 'r') as f:
     for line in f:
-        e = eval(line)
+        e = json.loads(line)
         if e['asin'] in itemmap:
             related_infor = {}
             for rel in RELATION_FIELDS:
@@ -175,7 +199,7 @@ for user in user_train.keys():
 # position-distance decay when timestamps aren't present.
 new_dataset = [user_train, user_validation, user_testing, Item, Item_relationship_mask_mat_completeseqs, relationships_ind_map, usernum, itemnum,
                 user_train_times, user_validation_times, user_testing_times]
-np.save('./'+DATASET+'Partitioned_5core', new_dataset)
+np.save('./data/'+DATASET+'Partitioned_5core', new_dataset)
 
 
 print(usernum, itemnum)
