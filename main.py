@@ -2,6 +2,7 @@
 # @Time    : 2020/4/25 22:59
 
 import os
+import time
 import numpy as np
 import random
 import torch
@@ -107,13 +108,33 @@ def main():
     args.has_real_timestamps = user_seq_times is not None
 
     # save model args
-    args_str = f'{args.model_name}-{args.data_name}-{args.hidden_size}-{args.num_hidden_layers}-{args.num_attention_heads}-{args.hidden_act}-{args.attention_probs_dropout_prob}-{args.hidden_dropout_prob}-{args.max_seq_length}-{args.lr}-{args.weight_decay}-{args.rel_loss_weight}-{args.ckp}'
+    # NOTE: seed and outseq_rel_loss_weight are part of the name so that repeated
+    # runs differing only by seed (multi-seed experiments) or by the inter-sequence
+    # loss weight get distinct log files and checkpoints instead of silently
+    # appending to / overwriting each other.
+    args_str = f'{args.model_name}-{args.data_name}-{args.hidden_size}-{args.num_hidden_layers}-{args.num_attention_heads}-{args.hidden_act}-{args.attention_probs_dropout_prob}-{args.hidden_dropout_prob}-{args.max_seq_length}-{args.lr}-{args.weight_decay}-{args.rel_loss_weight}-{args.outseq_rel_loss_weight}-{args.ckp}-seed{args.seed}'
     if args.model_name == 'DynamicRelationAwareSASRecModel':
         # Distinguish D-MT4SR ablation runs (which flags were on, and whether
         # this run's preprocessed data actually carried real timestamps) in
         # the log/checkpoint filename.
         args_str += f'-timedecay{args.use_time_decay}-realtimes{args.has_real_timestamps}-dynloss{args.dynamic_loss_weights}-popneg{args.popularity_neg_sampling}'
+        if args.use_time_decay:
+            # time_scale / time_decay_floor only affect runs with decay enabled,
+            # but when they do, they must appear in the name -- otherwise e.g. a
+            # 1-day-scale and a 30-day-scale run overwrite each other.
+            args_str += f'-tscale{args.time_scale}-tfloor{args.time_decay_floor}'
     args.log_file = os.path.join(args.output_dir, args_str + '.txt')
+    # main.py appends to the log, so re-running the same config+seed (e.g. after
+    # an interrupted run, or with the runner's --force) would otherwise mix two
+    # runs into one file. Rotate any existing log aside first so each execution
+    # gets its own clean file and nothing is lost. Skipped for --do_eval, which
+    # is meant to append its evaluation to the training run's log.
+    if not args.do_eval and os.path.exists(args.log_file):
+        rotated = os.path.join(
+            args.output_dir,
+            args_str + '.prev-' + time.strftime('%Y%m%d-%H%M%S') + '.txt')
+        os.rename(args.log_file, rotated)
+        print(f'Existing log moved to {rotated}')
     print(str(args))
     with open(args.log_file, 'a') as f:
         f.write(str(args) + '\n')
