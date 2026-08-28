@@ -91,6 +91,25 @@ SHARED_ARGS = [
     '--outseq_rel_loss_weight=0.05',
 ]
 
+# Per-dataset extra arguments, applied to every config for that dataset so
+# comparisons within a dataset stay controlled.
+#
+# --rel_loss_chunk_size computes the inter-sequence relation loss in chunks
+# under gradient checkpointing: identical value and gradients, bounded peak
+# memory, at the cost of some speed. It's only needed when the catalog is
+# large enough that the (batch*seq*num_rel, item_size) logits tensor won't fit
+# in GPU memory, so datasets that don't need it are left alone (an empty/absent
+# entry means "run unchunked", which is both faster and the original behavior).
+#
+# Appliances is a mid-sized catalog (~30k products before 5-core filtering,
+# comparable to All_Beauty's ~33k), so it should run unchunked on a 12 GB card
+# just as All_Beauty does. If it OOMs, add an entry below, starting large --
+# e.g. ['--rel_loss_chunk_size=8192'] -- and only reduce if necessary, since
+# smaller chunks mean more checkpoint recomputation and slower training.
+DATASET_ARGS = {
+    # 'Appliances': ['--rel_loss_chunk_size=8192'],   # uncomment only if OOM
+}
+
 
 def build_plan(datasets, configs, main_seeds, extra_seed):
     """Returns a list of run descriptors."""
@@ -121,6 +140,7 @@ def build_command(run, output_dir, extra_args):
         f"--seed={run['seed']}",
     ]
     cmd += SHARED_ARGS
+    cmd += DATASET_ARGS.get(run['dataset'], [])
     cmd += cfg['flags']
     cmd += extra_args
     return cmd
@@ -191,8 +211,8 @@ def run_aggregation(output_dir, metrics):
 def main():
     ap = argparse.ArgumentParser(
         description='Run the D-MT4SR ablation suite and aggregate results.')
-    ap.add_argument('--datasets', nargs='+', default=['All_Beauty', 'Office_Products'],
-                    help='datasets to run (default: All_Beauty Office_Products)')
+    ap.add_argument('--datasets', nargs='+', default=['All_Beauty', 'Appliances'],
+                    help='datasets to run (default: All_Beauty Appliances)')
     ap.add_argument('--configs', nargs='+',
                     default=MAIN_CONFIGS + EXTRA_CONFIGS,
                     help=f'configs to run. Known: {", ".join(CONFIGS)}')

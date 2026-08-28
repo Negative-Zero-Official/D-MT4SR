@@ -64,6 +64,15 @@ def main():
                              "the relation signal on sparse datasets where interactions are far "
                              "apart in time or position. 0.0 disables the floor (original behavior).")
 
+    parser.add_argument('--rel_loss_chunk_size', default=0, type=int,
+                        help="Compute the inter-sequence relation loss in row-chunks of this "
+                             "size under gradient checkpointing, bounding peak GPU memory. "
+                             "Mathematically identical to the unchunked loss (same value and "
+                             "gradients), just slower. 0 = disabled (original behavior). "
+                             "Needed for large-catalog datasets such as Office_Products, where "
+                             "the full (batch*seq*num_rel, item_size) logits tensor can exceed "
+                             "GPU memory. Try 2048 or 1024 if you hit CUDA OOM.")
+
     # train args
     parser.add_argument("--lr", type=float, default=0.001, help="learning rate of adam")
     parser.add_argument("--batch_size", type=int, default=128, help="number of batch_size")

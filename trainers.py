@@ -856,7 +856,6 @@ class RelationAwareSASRecModelTrainer(Trainer):
 
     def relation_outside_seq_loss(self, item_rel, item_rel_pos, relationship_embedding):
         # item_rel_pos: (B, L, num_rel)
-        ce_loss = torch.nn.CrossEntropyLoss(ignore_index=0)
         item_rel_emb = self.model.item_embeddings(item_rel) # (B, L, d)
         item_rel_pos = torch.reshape(item_rel_pos, (-1,))
 
@@ -865,9 +864,48 @@ class RelationAwareSASRecModelTrainer(Trainer):
         relationship_mapping = torch.reshape(relationship_mapping, (-1, relationship_mapping.shape[-1]))
 
         test_item_emb = self.model.item_embeddings.weight
-        logits = torch.matmul(relationship_mapping, test_item_emb.transpose(0, 1))
 
-        return ce_loss(logits, item_rel_pos)
+        # The logits tensor below is (B*L*num_rel, item_size). On small-catalog
+        # datasets that is fine, but on large ones it is enormous: for
+        # Office_Products (item_size ~136k) with B=128, L=100, num_rel=2 it is
+        # 25600 x 136077 floats ~= 13.9 GB, which OOMs a 12 GB GPU. This is a
+        # property of the original MT4SR loss, not of the D-MT4SR additions.
+        #
+        # When args.rel_loss_chunk_size > 0 we compute exactly the same loss in
+        # row-chunks under gradient checkpointing: each chunk's logits are
+        # freed after use and recomputed in the backward pass, so peak memory
+        # is set by the chunk size rather than the full batch. Using
+        # reduction='sum' per chunk and dividing by the number of non-ignored
+        # targets at the end reproduces CrossEntropyLoss(ignore_index=0)'s
+        # default 'mean' reduction exactly -- same value, same gradients.
+        chunk_size = getattr(self.args, 'rel_loss_chunk_size', 0)
+        num_rows = relationship_mapping.shape[0]
+
+        if not chunk_size or chunk_size <= 0 or chunk_size >= num_rows:
+            ce_loss = torch.nn.CrossEntropyLoss(ignore_index=0)
+            logits = torch.matmul(relationship_mapping, test_item_emb.transpose(0, 1))
+            return ce_loss(logits, item_rel_pos)
+
+        def _chunk_sum_loss(rows, targets):
+            logits = torch.matmul(rows, test_item_emb.transpose(0, 1))
+            return torch.nn.functional.cross_entropy(
+                logits, targets, ignore_index=0, reduction='sum')
+
+        total = relationship_mapping.new_zeros(())
+        for start in range(0, num_rows, chunk_size):
+            rows = relationship_mapping[start:start + chunk_size]
+            targets = item_rel_pos[start:start + chunk_size]
+            if self.model.training and rows.requires_grad:
+                total = total + torch.utils.checkpoint.checkpoint(
+                    _chunk_sum_loss, rows, targets, use_reentrant=False)
+            else:
+                total = total + _chunk_sum_loss(rows, targets)
+
+        # Number of targets actually contributing (ignore_index=0 excluded).
+        # clamp(min=1) only guards the degenerate all-ignored batch, where the
+        # unchunked CrossEntropyLoss would return nan; here it returns 0.
+        num_valid = (item_rel_pos != 0).sum().clamp(min=1).to(total.dtype)
+        return total / num_valid
 
     
     def eval_analysis(self, dataloader, user_seq, args):

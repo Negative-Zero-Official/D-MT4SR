@@ -37,13 +37,6 @@ def load_metadata_asins(path):
 
 metadata_asins = load_metadata_asins(meta_path)
 
-if not os.path.isdir('./'+DATASET):
-    os.mkdir('./'+DATASET)
-train_file = './'+DATASET+'/train.txt'
-valid_file = './'+DATASET+'/valid.txt'
-test_file = './'+DATASET+'/test.txt'
-
-
 countU = defaultdict(lambda: 0)
 countP = defaultdict(lambda: 0)
 for one_interaction in parse(dataname):
