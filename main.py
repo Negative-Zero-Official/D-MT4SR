@@ -67,6 +67,8 @@ def main():
     # train args
     parser.add_argument("--lr", type=float, default=0.001, help="learning rate of adam")
     parser.add_argument("--batch_size", type=int, default=128, help="number of batch_size")
+    parser.add_argument("--relation_loss_chunk_size", type=int, default=1024,
+                        help="number of relation examples used per inter-sequence loss chunk")
     parser.add_argument("--epochs", type=int, default=500, help="number of epochs")
     parser.add_argument("--no_cuda", action="store_true")
     parser.add_argument("--log_freq", type=int, default=1, help="per epoch print res")

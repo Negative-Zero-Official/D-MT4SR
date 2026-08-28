@@ -856,7 +856,7 @@ class RelationAwareSASRecModelTrainer(Trainer):
 
     def relation_outside_seq_loss(self, item_rel, item_rel_pos, relationship_embedding):
         # item_rel_pos: (B, L, num_rel)
-        ce_loss = torch.nn.CrossEntropyLoss(ignore_index=0)
+        ce_loss = torch.nn.CrossEntropyLoss(ignore_index=0, reduction='sum')
         item_rel_emb = self.model.item_embeddings(item_rel) # (B, L, d)
         item_rel_pos = torch.reshape(item_rel_pos, (-1,))
 
@@ -865,9 +865,22 @@ class RelationAwareSASRecModelTrainer(Trainer):
         relationship_mapping = torch.reshape(relationship_mapping, (-1, relationship_mapping.shape[-1]))
 
         test_item_emb = self.model.item_embeddings.weight
-        logits = torch.matmul(relationship_mapping, test_item_emb.transpose(0, 1))
+        targets = item_rel_pos
+        chunk_size = max(1, getattr(self.args, 'relation_loss_chunk_size', 1024))
+        total_loss = relationship_mapping.new_zeros(())
+        for start in range(0, relationship_mapping.shape[0], chunk_size):
+            end = start + chunk_size
+            logits = torch.matmul(
+                relationship_mapping[start:end],
+                test_item_emb.transpose(0, 1),
+            )
+            total_loss = total_loss + ce_loss(
+                logits,
+                targets[start:end],
+            )
 
-        return ce_loss(logits, item_rel_pos)
+        valid_targets = targets.ne(0).sum()
+        return total_loss / valid_targets
 
     
     def eval_analysis(self, dataloader, user_seq, args):
