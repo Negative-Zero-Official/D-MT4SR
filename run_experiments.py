@@ -231,8 +231,23 @@ def main():
     plan = build_plan(args.datasets, args.configs, args.seeds, args.extra_seed)
     status = load_status(status_path)
 
-    todo = [r for r in plan
-            if args.force or status.get(r['tag'], {}).get('state') != 'completed']
+    def needs_run(r):
+        if args.force:
+            return True
+        entry = status.get(r['tag'], {})
+        if entry.get('state') != 'completed':
+            return True
+        # A completed run only counts if it was produced by the SAME command.
+        # Otherwise a short trial (e.g. --passthrough --epochs=3) would be
+        # mistaken for a finished full run and silently skipped, putting
+        # trial-length numbers into the final table.
+        planned = ' '.join(build_command(r, output_dir, args.passthrough))
+        return entry.get('command') != planned
+
+    todo = [r for r in plan if needs_run(r)]
+    stale = [r for r in plan
+             if status.get(r['tag'], {}).get('state') == 'completed'
+             and r in todo and not args.force]
     already = len(plan) - len(todo)
 
     print(f'\nPlanned runs: {len(plan)}  '
@@ -244,6 +259,14 @@ def main():
     if extras:
         print(f'Supporting configs (seed {args.extra_seed} only): {", ".join(extras)}')
     print(f'Output dir: {output_dir}\n')
+
+    if stale:
+        print(f'NOTE: {len(stale)} run(s) were previously completed with a '
+              'DIFFERENT command (e.g. a shorter trial via --passthrough).')
+        print('      They will be re-run so trial-length results do not end up '
+              'in the final table.')
+        print('      Their old logs are rotated aside to *.prev-*.txt and are '
+              'excluded from aggregation.\n')
 
     check_data_present(args.datasets)
 
