@@ -7,14 +7,20 @@ import json
 import numpy as np
 
 def parse(path):
-  g = gzip.open(path, 'r')
-  for l in g:
-      yield eval(l)
+    g = gzip.open(path, 'r')
+    for l in g:
+        yield json.loads(l)
 
 
 DATASET = 'Office_Products'
-dataname = '/home/zfan/BDSC/projects/datasets/reviews_' + DATASET + '_5.json.gz'
-meta_path = '/home/zfan/BDSC/projects/datasets/newmetadata/meta_{}.json.gz'.format(DATASET)
+# Amazon Reviews 2018 v2 (jmcauley.ucsd.edu/data/amazon_v2/) filenames -- put
+# the downloaded .json.gz files in the same directory as this script (or
+# change these paths). Either the raw per-category reviews file
+# (e.g. "Office_Products.json.gz") or its pre-filtered 5-core version
+# (e.g. "Office_Products_5.json.gz") both work: the 5-core filtering below
+# (countU[rev] < 5) re-applies the filter itself either way.
+dataname = './data/' + DATASET + '.json.gz'
+meta_path = './data/meta_' + DATASET + '.json.gz'
 if not os.path.isdir('./'+DATASET):
     os.mkdir('./'+DATASET)
 train_file = './'+DATASET+'/train.txt'
@@ -66,12 +72,24 @@ for userid in User.keys():
 Item = {}
 relationships_ind_map = {}
 r_ind = 0
+# Amazon Reviews 2018 v2 exposes item relationships as two flat top-level
+# fields -- 'also_buy' and 'also_view' (each a list of related ASINs) --
+# rather than the older nested 'related': {'also_bought': [...], 'also_viewed':
+# [...]} dict this script originally expected (that schema, and the 'related'
+# key itself, doesn't exist in this dataset version; the still-newer 2023
+# Amazon Reviews dataset drops both 'also_buy' and 'also_view' entirely and
+# only keeps a much sparser 'bought_together', so 2018 v2 is the newest
+# version that still supports MT4SR's multi-relation architecture).
+# We treat each field as its own relationship type, directly analogous to the
+# old dataset's 'also_bought'/'also_viewed' relations.
+RELATION_FIELDS = ['also_buy', 'also_view']
 with gzip.open(meta_path, 'r') as f:
     for line in f:
         e = eval(line)
         if e['asin'] in itemmap:
             related_infor = {}
-            for rel, rel_list in e.get('related', {}).items():
+            for rel in RELATION_FIELDS:
+                rel_list = e.get(rel, []) or []  # field may be missing or null on some records
                 if rel not in relationships_ind_map:
                     relationships_ind_map[rel] = r_ind
                     r_ind += 1
@@ -156,7 +174,7 @@ for user in user_train.keys():
 # format it's loading via len(dataset) and falls back gracefully to
 # position-distance decay when timestamps aren't present.
 new_dataset = [user_train, user_validation, user_testing, Item, Item_relationship_mask_mat_completeseqs, relationships_ind_map, usernum, itemnum,
-               user_train_times, user_validation_times, user_testing_times]
+                user_train_times, user_validation_times, user_testing_times]
 np.save('./'+DATASET+'Partitioned_5core', new_dataset)
 
 
