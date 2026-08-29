@@ -1,6 +1,6 @@
 # Results
 
-After running (run_experiments.py)[run_experiments.py], the results printed to console are as follows:
+After running [run_experiments.py](run_experiments.py), the results printed to console are as follows:
 
 ```plaintext
 Planned runs: 24  (already completed: 0, to run now: 24)
