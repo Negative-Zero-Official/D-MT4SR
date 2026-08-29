@@ -67,13 +67,96 @@ CONFIGS = {
         'flags': ['--dynamic_loss_weights', '--popularity_neg_sampling'],
         'desc': 'D-MT4SR + adaptive loss weights + popularity sampling',
     },
+
+    # ----------------------------------------------------------------------
+    # D-MT4SR v2. The v1 results showed the problem was VARIANCE, not the
+    # mean: on All_Beauty the dynamic gate's seed spread was 4-8x the
+    # baseline's, which makes a small mean improvement undetectable. These
+    # configs attack that first, then add capacity on top.
+    # ----------------------------------------------------------------------
+    # The control row. MT4SR with ONLY the relation-score normalization
+    # applied -- no dynamic gating at all. Without this row there is no way to
+    # separate "dynamic relation weighting helps" from "normalizing the
+    # relation scores helps and any weighting scheme would now work". Run this
+    # on all seeds; it is the comparison a reviewer will ask for first.
+    'baseline_norm': {
+        'model_name': 'RelationAwareSASRecModel',
+        'flags': ['--rel_score_norm=std'],
+        'desc': 'CONTROL: original MT4SR + relation-score normalization only',
+    },
+    'v2': {
+        'model_name': 'DynamicRelationAwareSASRecModel',
+        'flags': ['--gate_residual', '--gate_lr_scale=0.1', '--rel_score_norm=std'],
+        'desc': 'D-MT4SR v2: residual gate + slow gate LR + relation-score norm',
+    },
+    # v2 without the normalization, to isolate how much of v2's effect comes
+    # from the gate changes alone versus from unsaturating the attention.
+    'v2_nonorm': {
+        'model_name': 'DynamicRelationAwareSASRecModel',
+        'flags': ['--gate_residual', '--gate_lr_scale=0.1'],
+        'desc': 'v2 gate changes only, WITHOUT relation-score normalization',
+    },
+    'v2_ent': {
+        'model_name': 'DynamicRelationAwareSASRecModel',
+        'flags': ['--gate_residual', '--gate_lr_scale=0.1', '--rel_score_norm=std',
+                  '--gate_entropy_weight=0.05', '--gate_entropy_epochs=30'],
+        'desc': 'v2 + annealed gate-entropy regularization',
+    },
+    'v2_mask': {
+        'model_name': 'DynamicRelationAwareSASRecModel',
+        'flags': ['--gate_residual', '--gate_lr_scale=0.1', '--rel_score_norm=std',
+                  '--gate_use_rel_mask'],
+        'desc': 'v2 + observed-relation mask fed into the gate',
+    },
+    'v2_pair': {
+        'model_name': 'DynamicRelationAwareSASRecModel',
+        'flags': ['--gate_residual', '--gate_lr_scale=0.1', '--rel_score_norm=std',
+                  '--gate_pairwise'],
+        'desc': 'v2 + pairwise (query,key)-conditioned gate',
+    },
+    'v2_full': {
+        'model_name': 'DynamicRelationAwareSASRecModel',
+        'flags': ['--gate_residual', '--gate_lr_scale=0.1', '--rel_score_norm=std',
+                  '--gate_pairwise', '--gate_use_rel_mask',
+                  '--gate_entropy_weight=0.05', '--gate_entropy_epochs=30'],
+        'desc': 'v2 + pairwise + relation mask + entropy regularization',
+    },
+    'v2_dynloss': {
+        'model_name': 'DynamicRelationAwareSASRecModel',
+        'flags': ['--gate_residual', '--gate_lr_scale=0.1', '--rel_score_norm=std',
+                  '--dynamic_loss_weights'],
+        'desc': 'v2 + adaptive intra/inter loss weights',
+    },
+    'timedecay_log': {
+        'model_name': 'DynamicRelationAwareSASRecModel',
+        'flags': ['--gate_residual', '--gate_lr_scale=0.1', '--rel_score_norm=std',
+                  '--use_time_decay', '--time_decay_log'],
+        'desc': 'v2 + log-compressed real-timestamp relation decay',
+    },
+    'popneg_mix': {
+        'model_name': 'DynamicRelationAwareSASRecModel',
+        'flags': ['--gate_residual', '--gate_lr_scale=0.1', '--rel_score_norm=std',
+                  '--popularity_neg_sampling', '--popneg_mix=0.5'],
+        'desc': 'v2 + 50/50 popularity/uniform negative sampling',
+    },
 }
 
 # Configs carrying the main positive claim -> run across all seeds.
-MAIN_CONFIGS = ['baseline', 'v1', 'dynloss']
+MAIN_CONFIGS = ['baseline', 'baseline_norm', 'v1', 'dynloss', 'v2',
+                'v2_nonorm', 'v2_ent', 'v2_mask', 'v2_pair', 'v2_full',
+                'v2_dynloss']
 # Supporting / negative-result configs -> single seed is enough to report
 # "we explored this and it did not improve over our base configuration".
-EXTRA_CONFIGS = ['popneg', 'timedecay', 'dynloss_popneg']
+EXTRA_CONFIGS = ['popneg', 'timedecay', 'dynloss_popneg', 'timedecay_log',
+                 'popneg_mix']
+
+# Preset for the fast go/no-go check described in the README: a short,
+# epoch-capped run of baseline vs v1 vs v2 on the SAME seeds. The point is not
+# to measure final quality (these runs are deliberately under-trained) but to
+# see whether v2's seed spread collapses toward the baseline's, which is the
+# thing v2 was built to fix and which is measurable at a fixed epoch budget.
+QUICK_CONFIGS = ['baseline', 'baseline_norm', 'v1', 'v2']
+QUICK_EPOCHS = 60
 
 # Hyperparameters held constant across every run (matching the MT4SR paper's
 # setup for these datasets). Changing anything here invalidates comparisons
@@ -193,7 +276,7 @@ def format_duration(seconds):
     return f'{s}s'
 
 
-def run_aggregation(output_dir, metrics):
+def run_aggregation(output_dir, metrics, paired=True):
     if not os.path.exists('aggregate_results.py'):
         print("\n(aggregate_results.py not found next to this script -- "
               "skipping aggregation.)")
@@ -202,10 +285,11 @@ def run_aggregation(output_dir, metrics):
         print('\n' + '=' * 70)
         print(f'AGGREGATED RESULTS: {metric}')
         print('=' * 70)
-        subprocess.run(
-            [sys.executable, 'aggregate_results.py', output_dir, f'--metric={metric}'],
-            check=False,
-        )
+        cmd = [sys.executable, 'aggregate_results.py', output_dir,
+               f'--metric={metric}']
+        if paired:
+            cmd.append('--paired')
+        subprocess.run(cmd, check=False)
 
 
 def main():
@@ -232,17 +316,52 @@ def main():
                     help='skip training, just aggregate existing logs')
     ap.add_argument('--stop-on-failure', action='store_true',
                     help='abort the suite if any run fails (default: continue)')
+    ap.add_argument('--quick', action='store_true',
+                    help='fast go/no-go check: baseline vs v1 vs v2 on one dataset, '
+                         f'capped at {QUICK_EPOCHS} epochs, into quick_check/ by default. '
+                         'Deliberately under-trained -- read the SEED SPREAD, not the '
+                         'absolute numbers.')
+    ap.add_argument('--paired', action='store_true', default=True,
+                    help='include the paired-by-seed comparison in the aggregation '
+                         '(default: on)')
+    ap.add_argument('--no-paired', dest='paired', action='store_false',
+                    help='suppress the paired comparison')
     ap.add_argument('--passthrough', nargs=argparse.REMAINDER, default=[],
                     help='extra args forwarded verbatim to main.py '
                          '(e.g. --passthrough --epochs=50)')
     args = ap.parse_args()
+
+    if args.quick:
+        # Only override what the user didn't explicitly set. argparse doesn't
+        # tell us that directly, so compare against the declared defaults.
+        if args.configs == MAIN_CONFIGS + EXTRA_CONFIGS:
+            args.configs = list(QUICK_CONFIGS)
+        if args.output_dir == 'paper_runs/':
+            # IMPORTANT: never write quick runs into paper_runs/. main.py
+            # rotates any existing log for the same config+seed aside to
+            # *.prev-*.txt, and aggregate_results.py ignores those -- so a
+            # quick run in paper_runs/ would silently retire the full-length
+            # results already collected there.
+            args.output_dir = 'quick_check/'
+        if args.datasets == ['All_Beauty', 'Appliances']:
+            args.datasets = ['All_Beauty']
+        if not any(a.startswith('--epochs') for a in args.passthrough):
+            args.passthrough = list(args.passthrough) + [f'--epochs={QUICK_EPOCHS}']
+        print(f'\n*** QUICK CHECK MODE ***')
+        print(f'  configs : {", ".join(args.configs)}')
+        print(f'  dataset : {", ".join(args.datasets)}')
+        print(f'  seeds   : {args.seeds}')
+        print(f'  epochs  : capped at {QUICK_EPOCHS} (runs are UNDER-TRAINED on purpose)')
+        print(f'  output  : {args.output_dir}  (kept separate from paper_runs/)')
+        print('  Read the per-seed spread and the paired deltas, not the absolute')
+        print('  metric values -- 60 epochs is not a converged model.\n')
 
     output_dir = args.output_dir
     console_dir = os.path.join(output_dir, 'console')
     status_path = os.path.join(output_dir, 'run_status.json')
 
     if args.aggregate_only:
-        run_aggregation(output_dir, args.metrics)
+        run_aggregation(output_dir, args.metrics, paired=args.paired)
         return
 
     os.makedirs(output_dir, exist_ok=True)
@@ -303,7 +422,7 @@ def main():
 
     if not todo:
         print('Nothing to run. Aggregating existing results.\n')
-        run_aggregation(output_dir, args.metrics)
+        run_aggregation(output_dir, args.metrics, paired=args.paired)
         return
 
     suite_start = time.time()
@@ -374,7 +493,7 @@ def main():
             print(f'  {tag} (exit {rc}) -> {path}')
         print('\nFix the cause and re-run this script; successful runs are skipped.')
 
-    run_aggregation(output_dir, args.metrics)
+    run_aggregation(output_dir, args.metrics, paired=args.paired)
 
 
 if __name__ == '__main__':

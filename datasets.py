@@ -395,7 +395,20 @@ class DynamicRelationAwareSASRecDataset(RelationAwareSASRecDataset):
 
     def sample_negative(self, seq_set):
         if getattr(self.args, 'popularity_neg_sampling', False) and self.sampling_probs is not None:
-            return neg_sample_popularity(seq_set, self.args.item_size, self.sampling_probs)
+            # args.popneg_mix is the probability that a given negative is drawn
+            # from the popularity distribution; the rest are uniform. 1.0 (the
+            # default) is the original all-popularity behavior.
+            #
+            # Pure popularity sampling repeatedly pushes down the scores of
+            # exactly the items that full-sort HIT/NDCG/MRR reward ranking
+            # highly, which is a coherent explanation for why it hurt and why
+            # those runs early-stopped so quickly. A mixture keeps the hard
+            # negatives while leaving enough uniform mass that popular items
+            # aren't systematically suppressed.
+            mix = float(getattr(self.args, 'popneg_mix', 1.0))
+            if mix >= 1.0 or random.random() < mix:
+                return neg_sample_popularity(seq_set, self.args.item_size, self.sampling_probs)
+            return neg_sample(seq_set, self.args.item_size)
         return super(DynamicRelationAwareSASRecDataset, self).sample_negative(seq_set)
 
     def extra_tensors(self, index, items, input_slice):

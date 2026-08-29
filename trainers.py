@@ -10,7 +10,7 @@ import torch
 import torch.nn as nn
 from torch.optim import Adam
 
-from utils import recall_at_k, ndcg_k, get_metric, cal_mrr, get_user_performance_perpopularity, get_item_performance_perpopularity
+from utils import recall_at_k, ndcg_k, get_metric, cal_mrr, get_user_performance_perpopularity, get_item_performance_perpopularity, ModelEMA
 from modules import wasserstein_distance, kl_distance, wasserstein_distance_matmul, d2s_gaussiannormal, d2s_1overx, kl_distance_matmul
 
 
@@ -35,10 +35,68 @@ class Trainer:
 
         # self.data_name = self.args.data_name
         betas = (self.args.adam_beta1, self.args.adam_beta2)
-        self.optim = Adam(self.model.parameters(), lr=self.args.lr, betas=betas, weight_decay=self.args.weight_decay)
+        self.optim = Adam(self._param_groups(), lr=self.args.lr, betas=betas,
+                          weight_decay=self.args.weight_decay)
+
+        # Optional exponential moving average of the weights. Evaluating and
+        # checkpointing the EMA instead of the raw weights removes most of the
+        # "lucky epoch" component of model selection, which matters a lot on
+        # small datasets where per-epoch validation MRR is itself noisy.
+        # Enabled for every model (baseline included) so comparisons stay fair.
+        ema_decay = float(getattr(self.args, 'ema_decay', 0.0))
+        self.ema = ModelEMA(self.model, decay=ema_decay) if ema_decay > 0.0 else None
 
         print("Total Parameters:", sum([p.nelement() for p in self.model.parameters()]), flush=True)
         self.criterion = nn.BCELoss()
+
+    # Names matched here get their own optimizer param group at
+    # args.gate_lr_scale * args.lr. The relation gate is a small auxiliary
+    # module sitting on top of an otherwise-tuned architecture; letting it
+    # move at the same rate as the main network is a plausible source of the
+    # run-to-run instability seen in the plain dynamic gate.
+    GATE_PARAM_KEYS = ('relation_gate', 'gate_scale', 'relation_mask_bias')
+
+    def _param_groups(self):
+        scale = float(getattr(self.args, 'gate_lr_scale', 1.0))
+        if scale == 1.0:
+            return self.model.parameters()
+        gate_params, other_params = [], []
+        for name, param in self.model.named_parameters():
+            if any(k in name for k in self.GATE_PARAM_KEYS):
+                gate_params.append(param)
+            else:
+                other_params.append(param)
+        if not gate_params:
+            return self.model.parameters()
+        print(f"Gate LR scale {scale}: {len(gate_params)} gate tensor(s) at "
+              f"lr={self.args.lr * scale}", flush=True)
+        return [
+            {'params': other_params, 'lr': self.args.lr},
+            {'params': gate_params, 'lr': self.args.lr * scale},
+        ]
+
+    def _post_step(self):
+        """Called after every optimizer step. Updates the weight EMA if on."""
+        if self.ema is not None:
+            self.ema.update(self.model)
+
+    def gate_entropy(self):
+        """Mean relation-gate entropy across encoder layers, or None.
+
+        Returns the value cached by the most recent forward pass (see
+        modules.DynamicRelationAwareSelfAttention). None whenever entropy
+        regularization is off or the encoder has no gate, so callers can add
+        the term unconditionally without branching on model type.
+        """
+        encoder = getattr(self.model, 'item_encoder', None)
+        layers = getattr(encoder, 'layer', None)
+        if layers is None:
+            return None
+        ents = [layer.attention.last_gate_entropy for layer in layers
+                if getattr(layer.attention, 'last_gate_entropy', None) is not None]
+        if not ents:
+            return None
+        return sum(ents) / len(ents)
     def train(self, epoch):
         self.iteration(epoch, self.train_dataloader)
 
@@ -1016,6 +1074,11 @@ class RelationAwareSASRecModelTrainer(Trainer):
                 self.optim.zero_grad()
                 loss.backward()
                 self.optim.step()
+                # Weight-EMA bookkeeping. No-op unless --ema_decay is set;
+                # applied to the MT4SR baseline as well as D-MT4SR so any gain
+                # from averaging cannot be mistaken for a gain from the
+                # architecture.
+                self._post_step()
 
                 rec_avg_loss += loss.item()
                 rec_cur_loss = loss.item()
@@ -1114,6 +1177,25 @@ class DynamicRelationAwareSASRecModelTrainer(RelationAwareSASRecModelTrainer):
             test_dataloader, args
         )
 
+    def current_entropy_weight(self, epoch):
+        """Linearly annealed gate-entropy weight for this epoch.
+
+        Full strength at epoch 0, decaying to 0 by args.gate_entropy_epochs.
+        Setting --gate_entropy_epochs=0 keeps the weight constant for the whole
+        run instead (useful as an ablation, but a permanent uniformity prior is
+        usually not what you want).
+        """
+        w = float(getattr(self.args, 'gate_entropy_weight', 0.0))
+        if w <= 0.0:
+            return 0.0
+        anneal_epochs = int(getattr(self.args, 'gate_entropy_epochs', 0))
+        if anneal_epochs <= 0:
+            return w
+        if not isinstance(epoch, int):   # 'best' during final eval
+            return 0.0
+        frac = max(0.0, 1.0 - epoch / float(anneal_epochs))
+        return w * frac
+
     def get_loss_weights(self):
         if getattr(self.args, 'dynamic_loss_weights', False):
             # Learned multiplicative correction on top of the static,
@@ -1211,6 +1293,7 @@ class DynamicRelationAwareSASRecModelTrainer(RelationAwareSASRecModelTrainer):
             rec_avg_auc = 0.0
             rel_pred_loss = 0.0
             rel_pair_loss_avg = 0.0
+            gate_entropy_avg = 0.0
             for batch in rec_data_iter:
                 # 0. batch_data will be sent into the device(GPU or CPU)
                 batch = tuple(t.to(self.device) for t in batch)
@@ -1225,9 +1308,23 @@ class DynamicRelationAwareSASRecModelTrainer(RelationAwareSASRecModelTrainer):
                 loss = pred_loss
                 loss += alpha * next_rel_pred_loss
                 loss += beta * rel_pair_loss
+
+                # Gate entropy bonus (D-MT4SR v2). SUBTRACTED from the loss, so
+                # a spread-out relation distribution is rewarded and an
+                # early collapse onto a single relationship is penalized. The
+                # weight is annealed linearly to 0 over --gate_entropy_epochs
+                # so it shapes early training without permanently forcing the
+                # gate to stay uniform (which would defeat the point of having
+                # a gate at all).
+                gate_ent = self.gate_entropy()
+                if gate_ent is not None:
+                    loss = loss - self.current_entropy_weight(epoch) * gate_ent
+                    gate_entropy_avg += float(gate_ent.item())
+
                 self.optim.zero_grad()
                 loss.backward()
                 self.optim.step()
+                self._post_step()
 
                 rec_avg_loss += loss.item()
                 rec_cur_loss = loss.item()
@@ -1250,6 +1347,54 @@ class DynamicRelationAwareSASRecModelTrainer(RelationAwareSASRecModelTrainer):
                 "rel_pair_contributed_loss": '{:.8f}'.format(effective_beta * rel_pair_loss_avg / len(rec_data_iter)),
                 "has_real_timestamps": getattr(self.args, 'has_real_timestamps', False),
             }
+
+            # --- Attention saturation diagnostics --------------------------
+            # rel_score_absmax vs attn_entropy is the single most informative
+            # pair of numbers in this log. attn_entropy near 0 (max is
+            # log(max_seq_length) ~ 4.6 for L=100) means the attention
+            # distribution is effectively one-hot and the ordinary
+            # query/key pathway is being drowned out by the relation scores.
+            # See modules._init_rel_score_norm for the measurements.
+            first_attn = self.model.item_encoder.layer[0].attention
+            if getattr(first_attn, 'last_attn_entropy', None) is not None:
+                post_fix["rel_score_absmax"] = '{:.2f}'.format(
+                    first_attn.last_rel_score_absmax)
+                post_fix["attn_entropy"] = '{:.4f}'.format(
+                    first_attn.last_attn_entropy)
+                post_fix["attn_entropy_max"] = '{:.4f}'.format(
+                    math.log(self.args.max_seq_length))
+                if getattr(first_attn, 'rel_score_norm', 'none') != 'none':
+                    post_fix["rel_score_gain_per_layer"] = [
+                        round(float(layer.attention.rel_score_gain.detach().cpu().item()), 4)
+                        for layer in self.model.item_encoder.layer
+                    ]
+
+            # --- D-MT4SR v2 gate diagnostics -------------------------------
+            # These make it possible to tell from the log alone WHY a run
+            # behaved the way it did: whether the residual gate actually moved
+            # away from the static MT4SR weights, whether the distribution
+            # collapsed, and whether the observed-relation bias learned
+            # anything.
+            if getattr(first_attn, 'gate_residual', False):
+                # ~0 means "this run stayed at MT4SR's static weighting";
+                # growing in magnitude means the data supports context
+                # conditioning. Worth reporting in the paper directly.
+                post_fix["gate_scale_per_layer"] = [
+                    round(float(layer.attention.gate_scale.detach().cpu().item()), 6)
+                    for layer in self.model.item_encoder.layer
+                ]
+            if getattr(self.args, 'gate_entropy_weight', 0.0) > 0.0:
+                post_fix["gate_entropy_avg"] = '{:.4f}'.format(
+                    gate_entropy_avg / max(1, len(rec_data_iter)))
+                post_fix["gate_entropy_weight_now"] = '{:.6f}'.format(
+                    self.current_entropy_weight(epoch))
+            if getattr(first_attn, 'gate_use_rel_mask', False):
+                post_fix["relation_mask_bias_per_layer"] = [
+                    [round(v, 4) for v in
+                     layer.attention.relation_mask_bias.detach().cpu().tolist()]
+                    for layer in self.model.item_encoder.layer
+                ]
+
             if getattr(self.args, 'use_time_decay', False):
                 # Diagnostic: expose the learned per-relationship decay_rate
                 # (per layer) so it's possible to see from the log alone

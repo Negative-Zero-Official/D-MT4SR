@@ -6,12 +6,63 @@ import random
 import os
 import json
 import pickle
+from collections import deque
 from scipy.sparse import csr_matrix
 from tqdm import tqdm
 import multiprocessing
 
 import torch
 import torch.nn.functional as F
+
+
+class ModelEMA:
+    """Exponential moving average of model weights.
+
+    Maintains a shadow copy of every floating-point parameter, updated after
+    each optimizer step as  shadow = decay * shadow + (1 - decay) * param.
+    Integer buffers and non-float parameters are copied verbatim.
+
+    Used for model selection rather than for training: `copy_to()` swaps the
+    averaged weights into the live model for evaluation and `restore()` puts
+    the raw weights back, so training itself is completely unchanged. This is
+    a pure variance-reduction device -- an averaged model is far less
+    sensitive to which particular minibatch the last update happened to see,
+    which is exactly the noise that makes single-epoch validation scores (and
+    therefore checkpoint selection) unstable on small datasets.
+    """
+
+    def __init__(self, model, decay=0.999):
+        self.decay = float(decay)
+        self.shadow = {k: v.detach().clone()
+                       for k, v in model.state_dict().items()}
+        self._backup = None
+
+    @torch.no_grad()
+    def update(self, model):
+        for name, value in model.state_dict().items():
+            shadow = self.shadow.get(name)
+            if shadow is None or not shadow.is_floating_point():
+                self.shadow[name] = value.detach().clone()
+                continue
+            shadow.mul_(self.decay).add_(value.detach(), alpha=1.0 - self.decay)
+
+    def state_dict(self):
+        return self.shadow
+
+    @torch.no_grad()
+    def copy_to(self, model):
+        """Swaps the averaged weights into `model`, saving the live ones."""
+        self._backup = {k: v.detach().clone()
+                        for k, v in model.state_dict().items()}
+        model.load_state_dict(self.shadow)
+
+    @torch.no_grad()
+    def restore(self, model):
+        """Undoes copy_to(). No-op if copy_to() wasn't called."""
+        if self._backup is None:
+            return
+        model.load_state_dict(self._backup)
+        self._backup = None
 
 def set_seed(seed):
     random.seed(seed)
@@ -37,7 +88,8 @@ def neg_sample(item_set, item_size):
 
 class EarlyStopping:
     """Early stops the training if validation loss doesn't improve after a given patience."""
-    def __init__(self, checkpoint_path, patience=7, verbose=False, delta=0):
+    def __init__(self, checkpoint_path, patience=7, verbose=False, delta=0,
+                 smooth_window=1):
         """
         Args:
             patience (int): How long to wait after last time validation loss improved.
@@ -46,6 +98,17 @@ class EarlyStopping:
                             Default: False
             delta (float): Minimum change in the monitored quantity to qualify as an improvement.
                             Default: 0
+            smooth_window (int): Number of recent epochs to average the monitored
+                            score over before comparing. 1 = original behavior
+                            (compare the raw per-epoch score).
+
+                            On small datasets per-epoch validation MRR is noisy
+                            enough that argmax-over-epochs partly selects lucky
+                            epochs rather than good models -- and a
+                            higher-variance model gets more lucky epochs, which
+                            inflates both its reported score and its seed
+                            spread. Averaging over a short window makes model
+                            selection track the underlying trend instead.
         """
         self.checkpoint_path = checkpoint_path
         self.patience = patience
@@ -54,6 +117,15 @@ class EarlyStopping:
         self.best_score = None
         self.early_stop = False
         self.delta = delta
+        self.smooth_window = max(1, int(smooth_window))
+        self._history = deque(maxlen=self.smooth_window)
+
+    def _smooth(self, score):
+        """Averages the last `smooth_window` scores element-wise."""
+        if self.smooth_window == 1:
+            return score
+        self._history.append(np.asarray(score, dtype=float))
+        return np.mean(np.stack(list(self._history), axis=0), axis=0)
 
     def compare(self, score):
         for i in range(len(score)):
@@ -63,6 +135,7 @@ class EarlyStopping:
 
     def __call__(self, score, model):
         # score HIT@10 NDCG@10
+        score = self._smooth(score)
 
         if self.best_score is None:
             self.best_score = score

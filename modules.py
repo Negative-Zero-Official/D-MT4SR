@@ -210,6 +210,84 @@ class RelationAwareSelfAttention(nn.Module):
         self.LayerNorm = LayerNorm(args.hidden_size, eps=1e-12)
         self.out_dropout = nn.Dropout(args.hidden_dropout_prob)
 
+        self._init_rel_score_norm(args)
+
+    # ------------------------------------------------------------------
+    # Relation-score normalization
+    #
+    # MEASURED PROBLEM (hidden_size=128, 1 head, LayerNormed input):
+    #   ordinary attention scores  ~ 1.7 in magnitude
+    #   relation attention scores  ~ 45,000 in magnitude (std ~3,800)
+    #
+    # relationship_embedding is initialized as torch.rand(R, d, d) -- uniform
+    # on [0, 1], every entry POSITIVE -- and then squared via bmm, so
+    # relationship_embedding_sym has entries around d/4 = 32. Two einsum
+    # contractions over d=128 later, the relation term dominates the ordinary
+    # attention term by ~4 orders of magnitude.
+    #
+    # Consequence: softmax(attention_scores + rel_sum) is fully saturated at
+    # initialization -- measured mean max attention probability 0.9987, and
+    # attention entropy 0.003 out of a possible log(100) = 4.61. Gradients
+    # through a saturated softmax vanish, so the ENTIRE attention block sees
+    # ~1e-9 gradients, including relationship_weights (MT4SR's global relation
+    # weighting) and relation_gate (D-MT4SR's context-conditioned gate). The
+    # relation weighting the model is supposed to learn therefore stays frozen
+    # at its random initialization.
+    #
+    # rel_score_norm puts the relation pathway back on the same numerical
+    # footing as ordinary attention:
+    #   'none'      original behavior (keep for exact reproduction of MT4SR)
+    #   'std'       standardize relation scores per (batch, head, query) over
+    #               the (key, relation) dims, then apply a learnable gain
+    #   'layernorm' LayerNorm the relation MAPPING vectors before the score
+    #               matmul, then apply a learnable gain -- normalizes the
+    #               representation rather than the scores, so it does not
+    #               interact with causal/padding masking at all
+    # In both cases the gain is initialized to 1.0 and learned.
+    #
+    # This lives on the PARENT class deliberately: the fix must be available
+    # to plain MT4SR too, so `baseline + rel_score_norm` can be run as a
+    # control. Without that control there is no way to tell "dynamic gating
+    # helps" apart from "we fixed a saturation bug and now any relation
+    # weighting trains".
+    # ------------------------------------------------------------------
+    def _init_rel_score_norm(self, args):
+        self.rel_score_norm = getattr(args, 'rel_score_norm', 'none')
+        if self.rel_score_norm not in ('none', 'std', 'layernorm'):
+            raise ValueError(f"Unknown rel_score_norm '{self.rel_score_norm}' "
+                             "(expected none, std or layernorm)")
+        if self.rel_score_norm != 'none':
+            self.rel_score_gain = nn.Parameter(torch.ones(1))
+        if self.rel_score_norm == 'layernorm':
+            self.rel_map_LayerNorm = LayerNorm(self.all_head_size, eps=1e-12)
+        # Diagnostics, refreshed every forward pass and read by the trainer so
+        # the log alone shows whether the relation pathway is saturated.
+        self.last_rel_score_absmax = None
+        self.last_attn_entropy = None
+
+    def normalize_rel_mapping(self, relationship_mapping):
+        """Applied to (B, num_rel, L, d) before the relation score matmul."""
+        if self.rel_score_norm == 'layernorm':
+            return self.rel_map_LayerNorm(relationship_mapping)
+        return relationship_mapping
+
+    def normalize_rel_scores(self, scores):
+        """Applied to (B, h, L, L, num_rel) relation scores."""
+        if self.rel_score_norm == 'std':
+            mean = scores.mean(dim=(-2, -1), keepdim=True)
+            std = scores.std(dim=(-2, -1), keepdim=True)
+            scores = (scores - mean) / (std + 1e-6)
+        if self.rel_score_norm != 'none':
+            scores = scores * self.rel_score_gain
+        return scores
+
+    @torch.no_grad()
+    def record_attention_diagnostics(self, rel_scores, attention_probs):
+        """Caches saturation diagnostics for the trainer to log."""
+        self.last_rel_score_absmax = float(rel_scores.detach().abs().max())
+        p = attention_probs.detach().clamp_min(1e-12)
+        self.last_attn_entropy = float(-(p * p.log()).sum(-1).mean())
+
     def transpose_for_scores(self, x):
         new_x_shape = x.size()[:-1] + (self.num_attention_heads, self.attention_head_size)
         x = x.view(*new_x_shape)
@@ -247,6 +325,8 @@ class RelationAwareSelfAttention(nn.Module):
         #relationship_mapping = torch.einsum("ijk,ltk->ijlt", (input_tensor, self.relationship_embedding)) # get (B, L, num_rel, d)
         relationship_mapping = torch.einsum("ijk,ltk->ijlt", (input_tensor, relationship_embedding_sym)) # get (B, L, num_rel, d)
         relationship_mapping = relationship_mapping.permute(0, 2, 1, 3).contiguous() # get (B, num_rel, L, d)
+        # No-op unless --rel_score_norm=layernorm (see _init_rel_score_norm).
+        relationship_mapping = self.normalize_rel_mapping(relationship_mapping)
         relationship_heads_mapping = self.transpose_for_scores_relation(relationship_mapping) # get (B, num_rel, h, L, d/h)
         relationship_att_scores = torch.matmul(relationship_heads_mapping, relationship_heads_mapping.transpose(-1, -2)) # get(B, num_rel, h, L, L)
         relationship_att_scores = relationship_att_scores / math.sqrt(self.attention_head_size)
@@ -254,10 +334,15 @@ class RelationAwareSelfAttention(nn.Module):
         #relationship_att_scores = relationship_att_scores * expanded_input_relationships_masks / math.sqrt(self.attention_head_size)
         relationship_att_scores = relationship_att_scores / math.sqrt(self.attention_head_size)
         relationship_att_scores = relationship_att_scores.permute(0, 2, 3, 4, 1).contiguous()
+        # No-op unless --rel_score_norm is set. Without it these scores are
+        # ~4 orders of magnitude larger than attention_scores and saturate the
+        # softmax below, killing gradients for the whole block.
+        relationship_att_scores = self.normalize_rel_scores(relationship_att_scores)
 
         rel_sum_relationship_att_scores = torch.matmul(relationship_att_scores, relationship_weight_prob).squeeze(-1)
 
         attention_probs = nn.Softmax(dim=-1)(attention_scores.clone() + rel_sum_relationship_att_scores)
+        self.record_attention_diagnostics(rel_sum_relationship_att_scores, attention_probs)
 
         attention_probs = self.attn_dropout(attention_probs)
         context_layer = torch.matmul(attention_probs, value_layer)
@@ -651,11 +736,74 @@ class DynamicRelationAwareSelfAttention(RelationAwareSelfAttention):
         # relationships, predicted from the current hidden state at each
         # sequence position (i.e., dynamic per user/sequence/timestep instead
         # of fixed for the whole dataset).
-        self.relation_gate = nn.Linear(args.hidden_size, num_relationships)
-        # `relationship_weights` is inherited from the parent class but is no
-        # longer used in forward() below; kept only so code that introspects
-        # RelationAwareSelfAttention-family modules doesn't break on attribute
-        # access. The actual weighting comes from relation_gate instead.
+        #
+        # --- D-MT4SR v2 gate options (all opt-in, all default off) ----------
+        # gate_residual : anchor the gate to MT4SR's static relationship_weights
+        #                 so gate_scale=0 reproduces MT4SR exactly.
+        # gate_per_head : let each attention head have its own relation
+        #                 distribution instead of sharing one across heads.
+        # gate_pairwise : condition on the (query, key) PAIR via a low-rank
+        #                 additive term, not just the query position.
+        # gate_use_rel_mask : feed the observed also_buy/also_view pair mask
+        #                 into the gate logits (this signal is otherwise
+        #                 computed and thrown away).
+        # gate_temperature / gate_entropy_weight : sharpen or regularize the
+        #                 relation distribution to stop it collapsing early.
+        # --------------------------------------------------------------------
+        self.gate_residual = getattr(args, 'gate_residual', False)
+        self.gate_per_head = getattr(args, 'gate_per_head', False)
+        self.gate_pairwise = getattr(args, 'gate_pairwise', False)
+        self.gate_use_rel_mask = getattr(args, 'gate_use_rel_mask', False)
+        self.gate_temperature = float(getattr(args, 'gate_temperature', 1.0))
+        self.gate_entropy_weight = float(getattr(args, 'gate_entropy_weight', 0.0))
+
+        # Number of independent relation distributions produced per position:
+        # one per head if gate_per_head, otherwise one shared across heads.
+        self.gate_groups = self.num_attention_heads if self.gate_per_head else 1
+        gate_out = self.gate_groups * num_relationships
+
+        self.relation_gate = nn.Linear(args.hidden_size, gate_out)
+
+        if self.gate_pairwise:
+            # Low-rank additive pairwise term: logits_ij = W_q h_i + W_k h_j.
+            # Materializes two (B, L, groups*R) tensors and broadcast-adds them
+            # to (B, L, L, groups*R) -- no new large parameter matrices, and no
+            # tensor bigger than relationship_att_scores, which already exists.
+            # Initialized to zero so a pairwise run starts exactly where the
+            # query-only gate starts and only becomes pair-dependent if the
+            # data supports it.
+            self.relation_gate_key = nn.Linear(args.hidden_size, gate_out)
+            nn.init.zeros_(self.relation_gate_key.weight)
+            nn.init.zeros_(self.relation_gate_key.bias)
+
+        if self.gate_use_rel_mask:
+            # One learnable logit bonus per relationship, added to the gate
+            # logits at exactly those (i, j) pairs where that relationship
+            # actually holds in the item graph. Initialized to 0 so the run
+            # starts identical to the mask-free gate; a positive learned value
+            # means "trust this relation more where it is actually observed".
+            self.relation_mask_bias = nn.Parameter(torch.zeros(num_relationships))
+
+        if self.gate_residual:
+            # Multiplicative scale on the context-dependent part of the gate.
+            # Initialized to 0, so at step 0 the relation distribution is
+            # exactly softmax(relationship_weights) -- i.e. MT4SR. The dynamic
+            # component can only grow if it earns its keep. This makes
+            # D-MT4SR a strict generalization of MT4SR rather than a
+            # replacement, and removes the random-init relation prior that
+            # made the plain dynamic gate so seed-sensitive.
+            self.gate_scale = nn.Parameter(
+                torch.full((1,), float(getattr(args, 'gate_scale_init', 0.0))))
+
+        # Set by forward(); read by the trainer to add the entropy regularizer
+        # to the loss. Kept as a plain attribute (not a buffer) so it never
+        # ends up in state_dict and can't break checkpoint loading.
+        self.last_gate_entropy = None
+
+        # `relationship_weights` is inherited from the parent class. Without
+        # --gate_residual it is unused (the gate replaces it outright, as
+        # before); with --gate_residual it becomes the static anchor that the
+        # gate perturbs.
 
         self.use_time_decay = getattr(args, 'use_time_decay', False)
         # Set once per run in main.py based on whether the loaded .npy file
@@ -696,6 +844,16 @@ class DynamicRelationAwareSelfAttention(RelationAwareSelfAttention):
                 # time unit. Default 86400 = seconds/day, i.e. decay_rate is
                 # roughly "decay per day".
                 self.time_scale = getattr(args, 'time_scale', 86400.0)
+            # Log-compressed gaps. Amazon review data spans ~20 years, so with
+            # a 1-day time_scale the raw gap between two interactions routinely
+            # reaches 10^3-10^4 "days" -- exp(-rate * gap) then saturates at the
+            # floor for essentially every distant pair, which is why the floor
+            # was needed at all and why every distant pair ends up with the
+            # SAME weight (uninformative). Using log1p(gap) keeps the decay
+            # monotone in elapsed time while staying in a range where a
+            # learnable rate can actually discriminate a 1-week gap from a
+            # 1-year gap.
+            self.time_decay_log = getattr(args, 'time_decay_log', False)
 
     def forward(self, input_tensor, attention_mask, input_relationships_masks, input_times=None):
         # relationship_embedding shape: [num_rel, d, d]
@@ -722,6 +880,8 @@ class DynamicRelationAwareSelfAttention(RelationAwareSelfAttention):
 
         relationship_mapping = torch.einsum("ijk,ltk->ijlt", (input_tensor, relationship_embedding_sym))  # (B, L, num_rel, d)
         relationship_mapping = relationship_mapping.permute(0, 2, 1, 3).contiguous()  # (B, num_rel, L, d)
+        # No-op unless --rel_score_norm=layernorm.
+        relationship_mapping = self.normalize_rel_mapping(relationship_mapping)
         relationship_heads_mapping = self.transpose_for_scores_relation(relationship_mapping)  # (B, num_rel, h, L, d/h)
         relationship_att_scores = torch.matmul(relationship_heads_mapping, relationship_heads_mapping.transpose(-1, -2))  # (B, num_rel, h, L, L)
         relationship_att_scores = relationship_att_scores / math.sqrt(self.attention_head_size)
@@ -729,18 +889,77 @@ class DynamicRelationAwareSelfAttention(RelationAwareSelfAttention):
         # computed/available but not applied here either, to keep this an
         # apples-to-apples ablation of *only* the dynamic-weighting change.
         relationship_att_scores = relationship_att_scores.permute(0, 2, 3, 4, 1).contiguous()  # (B, h, L, L, num_rel)
+        # No-op unless --rel_score_norm is set. Critical for the gate: without
+        # it these scores saturate the attention softmax and relation_gate
+        # receives ~1e-9 gradients, i.e. the "dynamic" relation weighting is a
+        # frozen random projection rather than something the model learns.
+        relationship_att_scores = self.normalize_rel_scores(relationship_att_scores)
 
         batch_size, seq_len = input_tensor.size(0), input_tensor.size(1)
 
         # --- Dynamic, context-conditioned relation weighting ---
-        # gate_logits: (B, L, num_rel) -- a distribution over relationships
-        # predicted independently for each query position from its current
+        # Target broadcast shape is (B, h, L, L, num_rel), matching
+        # relationship_att_scores. We build the gate logits at the smallest
+        # rank that the enabled options require and let broadcasting do the
+        # rest, so the query-only gate still costs (B, L, R) and only
+        # --gate_pairwise / --gate_use_rel_mask pay for an (L, L) grid.
+        G, R = self.gate_groups, self.num_relationships
+
+        # (B, L, G, R): a distribution over relationships predicted for each
+        # query position (and each head, if --gate_per_head) from its current
         # representation, instead of one fixed vector for the whole dataset.
-        gate_logits = self.relation_gate(input_tensor)
-        dynamic_weights = nn.Softmax(dim=-1)(gate_logits)  # (B, L, num_rel)
-        # Reshape for broadcasting against (B, h, L, L, num_rel): weight is
-        # per query position (dim=2), shared across heads and key positions.
-        dynamic_weights = dynamic_weights.unsqueeze(1).unsqueeze(3)  # (B, 1, L, 1, num_rel)
+        gate_logits = self.relation_gate(input_tensor).view(batch_size, seq_len, G, R)
+        # -> (B, G, L, 1, R): [batch, head, query, key, relation]
+        gate_logits = gate_logits.permute(0, 2, 1, 3).unsqueeze(3)
+
+        if self.gate_pairwise:
+            # Additive low-rank pairwise term: logit_ij = W_q h_i + W_k h_j, so
+            # "which relation matters" becomes a property of the item PAIR
+            # rather than of the query item alone.
+            key_logits = self.relation_gate_key(input_tensor).view(batch_size, seq_len, G, R)
+            key_logits = key_logits.permute(0, 2, 1, 3).unsqueeze(2)  # (B, G, 1, L, R)
+            gate_logits = gate_logits + key_logits                    # (B, G, L, L, R)
+
+        if self.gate_use_rel_mask and input_relationships_masks is not None:
+            # input_relationships_masks: (B, num_rel, L, L), 1 where that
+            # relationship holds between positions i and j. Give the gate a
+            # learnable per-relationship bonus exactly on the observed edges.
+            # This is the one genuinely new signal here: the masks are
+            # computed by the dataset and, in the original MT4SR attention,
+            # never actually consulted.
+            rel_mask = input_relationships_masks.permute(0, 2, 3, 1)   # (B, L, L, R)
+            rel_mask = rel_mask.unsqueeze(1)                           # (B, 1, L, L, R)
+            gate_logits = gate_logits + rel_mask * self.relation_mask_bias.view(1, 1, 1, 1, R)
+
+        if self.gate_residual:
+            # Anchor on MT4SR's static per-relationship weights; the
+            # context-dependent part is a scaled perturbation of them.
+            # gate_scale == 0  =>  softmax(relationship_weights)  =>  MT4SR.
+            gate_logits = (self.relationship_weights.view(1, 1, 1, 1, R)
+                           + self.gate_scale * gate_logits)
+
+        if self.gate_temperature != 1.0:
+            gate_logits = gate_logits / self.gate_temperature
+
+        dynamic_weights = nn.Softmax(dim=-1)(gate_logits)
+
+        if self.gate_entropy_weight > 0.0 and self.training:
+            # Mean entropy of the relation distribution over *valid* query
+            # positions only. The trainer subtracts gate_entropy_weight * H
+            # from the loss, i.e. rewards keeping the distribution spread out
+            # early instead of collapsing onto one relationship, which is the
+            # failure mode behind the large seed-to-seed spread.
+            # attention_mask is 0 where a key is attendable and -10000 where it
+            # is masked, so a query position is real iff any key is attendable.
+            valid = (attention_mask > -1.0).any(dim=-1)               # (B, 1, L)
+            valid = valid.view(batch_size, 1, seq_len, 1).float()     # (B,1,L,1)
+            ent = -(dynamic_weights.clamp_min(1e-9).log() * dynamic_weights).sum(-1)
+            # ent: (B, G, L, 1) or (B, G, L, L) -> average over key dim first
+            ent = ent.mean(dim=-1, keepdim=True)
+            denom = valid.sum() * G
+            self.last_gate_entropy = (ent * valid).sum() / denom.clamp_min(1.0)
+        else:
+            self.last_gate_entropy = None
 
         if self.use_time_decay:
             decay_rate = torch.clamp(self.decay_rate, min=1e-4)  # (num_rel,), keep decay well-behaved
@@ -749,6 +968,11 @@ class DynamicRelationAwareSelfAttention(RelationAwareSelfAttention):
                 # Real elapsed-time decay: per-sample, per-position-pair gap in
                 # (typically) days, since each sample has its own timestamps.
                 time_gap = (input_times.unsqueeze(2) - input_times.unsqueeze(1)).abs() / self.time_scale  # (B, L, L)
+                if getattr(self, 'time_decay_log', False):
+                    # log1p compression: keeps decay monotone in elapsed time
+                    # but stops multi-year gaps from saturating every distant
+                    # pair to the floor (see __init__).
+                    time_gap = torch.log1p(time_gap)
                 raw_decay = torch.exp(-decay_rate.view(1, 1, 1, -1) * time_gap.unsqueeze(-1))  # (B, L, L, num_rel)
                 # Floor: even for maximally-distant/old pairs, at least `floor`
                 # of the relation signal survives, so a miscalibrated
@@ -774,6 +998,7 @@ class DynamicRelationAwareSelfAttention(RelationAwareSelfAttention):
         rel_sum_relationship_att_scores = torch.sum(relationship_att_scores * combined_weights, dim=-1)  # (B, h, L, L)
 
         attention_probs = nn.Softmax(dim=-1)(attention_scores.clone() + rel_sum_relationship_att_scores)
+        self.record_attention_diagnostics(rel_sum_relationship_att_scores, attention_probs)
 
         attention_probs = self.attn_dropout(attention_probs)
         context_layer = torch.matmul(attention_probs, value_layer)

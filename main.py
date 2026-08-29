@@ -16,6 +16,47 @@ from seqmodels import SASRecModel, DistSAModel, DistMeanSAModel, RelationAwareSA
 from utils import EarlyStopping, get_user_seqs, get_item2attribute_json, check_path, set_seed, get_user_seqs_MoHRdata, \
         compute_item_popularity, build_popularity_sampling_probs
 
+
+# D-MT4SR v2 options are appended to the run name ONLY when they differ from
+# the v1 defaults. That keeps every filename produced by the previous version
+# of this script byte-identical, so already-collected baseline/v1/dynloss logs
+# still group correctly in aggregate_results.py instead of splitting off into
+# new configs the moment these flags exist.
+_V2_NAME_PARTS = [
+    ('gate_residual', False, lambda v: 'gres'),
+    ('gate_scale_init', 0.0, lambda v: f'gsi{v}'),
+    ('gate_pairwise', False, lambda v: 'gpair'),
+    ('gate_use_rel_mask', False, lambda v: 'gmask'),
+    ('gate_per_head', False, lambda v: 'ghead'),
+    ('gate_temperature', 1.0, lambda v: f'gtemp{v}'),
+    ('gate_entropy_weight', 0.0, lambda v: f'gent{v}'),
+    ('gate_entropy_epochs', 0, lambda v: f'gente{v}'),
+    ('gate_lr_scale', 1.0, lambda v: f'glr{v}'),
+]
+# These apply to the MT4SR baseline too, so they're outside the model check.
+_STABILITY_NAME_PARTS = [
+    ('rel_score_norm', 'none', lambda v: f'rsn-{v}'),
+    ('ema_decay', 0.0, lambda v: f'ema{v}'),
+    ('val_smooth_window', 1, lambda v: f'vsm{v}'),
+    ('patience', 50, lambda v: f'pat{v}'),
+]
+
+
+def _suffix_from(args, parts):
+    out = ''
+    for attr, default, fmt in parts:
+        value = getattr(args, attr, default)
+        if value != default:
+            out += '-' + fmt(value)
+    return out
+
+
+def _append_variant_suffixes(args, args_str):
+    if args.model_name == 'DynamicRelationAwareSASRecModel':
+        args_str += _suffix_from(args, _V2_NAME_PARTS)
+    return args_str + _suffix_from(args, _STABILITY_NAME_PARTS)
+
+
 def main():
     parser = argparse.ArgumentParser()
 
@@ -63,6 +104,84 @@ def main():
                              "--use_time_decay). Prevents the learned decay from fully collapsing "
                              "the relation signal on sparse datasets where interactions are far "
                              "apart in time or position. 0.0 disables the floor (original behavior).")
+
+    # --- D-MT4SR v2: relation-gate options -------------------------------
+    # Everything here defaults to the v1 behavior, so existing runs and log
+    # filenames are unaffected unless a flag is explicitly set.
+    parser.add_argument('--gate_residual', action='store_true',
+                        help="D-MT4SR v2: express the context-conditioned relation gate as a "
+                             "scaled perturbation of MT4SR's static relationship_weights, "
+                             "instead of replacing them. With gate_scale initialized to 0 the "
+                             "model starts *exactly* at MT4SR, making D-MT4SR a strict "
+                             "generalization of the baseline and removing the random relation "
+                             "prior responsible for most of the seed-to-seed variance.")
+    parser.add_argument('--gate_scale_init', default=0.0, type=float,
+                        help="Initial value of the learnable gate_scale (only used with "
+                             "--gate_residual). 0.0 = start at the MT4SR solution.")
+    parser.add_argument('--gate_pairwise', action='store_true',
+                        help="D-MT4SR v2: condition the relation gate on the (query, key) PAIR "
+                             "via a low-rank additive term, not just the query position -- "
+                             "which relationship matters is naturally a property of the pair.")
+    parser.add_argument('--gate_use_rel_mask', action='store_true',
+                        help="D-MT4SR v2: add a learnable per-relationship logit bonus at the "
+                             "pairs where that relationship is actually observed in the item "
+                             "graph. These masks are computed by the dataset and never "
+                             "consulted by MT4SR's attention, so this is otherwise-discarded signal.")
+    parser.add_argument('--gate_per_head', action='store_true',
+                        help="D-MT4SR v2: give each attention head its own relation "
+                             "distribution instead of sharing one across heads. "
+                             "Only meaningful with --num_attention_heads > 1.")
+    parser.add_argument('--gate_temperature', default=1.0, type=float,
+                        help="D-MT4SR v2: softmax temperature for the relation gate. "
+                             ">1 flattens the distribution, <1 sharpens it. 1.0 = off.")
+    parser.add_argument('--gate_entropy_weight', default=0.0, type=float,
+                        help="D-MT4SR v2: reward (subtract from the loss) the entropy of the "
+                             "relation distribution, discouraging early collapse onto a single "
+                             "relationship. 0.0 = off. Try 0.01-0.1.")
+    parser.add_argument('--gate_entropy_epochs', default=0, type=int,
+                        help="Anneal --gate_entropy_weight linearly to 0 over this many epochs. "
+                             "0 = constant weight for the whole run.")
+    parser.add_argument('--gate_lr_scale', default=1.0, type=float,
+                        help="D-MT4SR v2: learning-rate multiplier for the gate parameters only "
+                             "(relation_gate, gate_scale, relation_mask_bias). 1.0 = off. "
+                             "Try 0.1 -- the gate is a small auxiliary module on an otherwise "
+                             "tuned architecture and does not need to move as fast.")
+
+    # --- Stability / model-selection options (apply to BOTH baseline and D-MT4SR) ---
+    parser.add_argument('--ema_decay', default=0.0, type=float,
+                        help="Keep an exponential moving average of the weights and use it for "
+                             "validation and checkpointing. 0.0 = off (original behavior). "
+                             "Try 0.999. Reduces the 'lucky epoch' component of model selection.")
+    parser.add_argument('--val_smooth_window', default=1, type=int,
+                        help="Average validation MRR over this many recent epochs before "
+                             "comparing for early stopping / checkpointing. 1 = original "
+                             "behavior. Try 3 on small datasets where per-epoch validation is noisy.")
+    parser.add_argument('--patience', default=50, type=int,
+                        help="Early-stopping patience in epochs (original MT4SR setup: 50).")
+
+    parser.add_argument('--popneg_mix', default=1.0, type=float,
+                        help="Probability that a negative is drawn from the popularity "
+                             "distribution rather than uniformly (only used with "
+                             "--popularity_neg_sampling). 1.0 = all-popularity (original). "
+                             "Try 0.5 -- pure popularity sampling systematically suppresses "
+                             "exactly the items full-sort metrics reward ranking highly.")
+    parser.add_argument('--time_decay_log', action='store_true',
+                        help="D-MT4SR: apply log1p compression to timestamp gaps before the "
+                             "decay. Amazon data spans ~20 years, so raw day-scale gaps saturate "
+                             "the decay for essentially every distant pair; log gaps keep it "
+                             "discriminative between a 1-week and a 1-year gap.")
+
+    parser.add_argument('--rel_score_norm', default='none',
+                        choices=['none', 'std', 'layernorm'],
+                        help="Normalize the relation attention scores before adding them to "
+                             "the ordinary attention logits. MEASURED: at hidden_size=128 the "
+                             "relation scores are ~4 orders of magnitude larger than the "
+                             "ordinary attention scores (~45000 vs ~1.7), which saturates the "
+                             "attention softmax to near one-hot (entropy 0.002 out of a "
+                             "possible 4.61) and keeps it there through training. 'std' "
+                             "standardizes them per query row and restores a healthy attention "
+                             "distribution. Available for the MT4SR baseline too, so it can be "
+                             "run as a control. 'none' = original behavior.")
 
     parser.add_argument('--rel_loss_chunk_size', default=0, type=int,
                         help="Compute the inter-sequence relation loss in row-chunks of this "
@@ -132,6 +251,11 @@ def main():
             # but when they do, they must appear in the name -- otherwise e.g. a
             # 1-day-scale and a 30-day-scale run overwrite each other.
             args_str += f'-tscale{args.time_scale}-tfloor{args.time_decay_floor}'
+            if args.time_decay_log:
+                args_str += '-tlog'
+        if args.popularity_neg_sampling and args.popneg_mix != 1.0:
+            args_str += f'-popmix{args.popneg_mix}'
+    args_str = _append_variant_suffixes(args, args_str)
     args.log_file = os.path.join(args.output_dir, args_str + '.txt')
     # main.py appends to the log, so re-running the same config+seed (e.g. after
     # an interrupted run, or with the runner's --force) would otherwise mix two
@@ -246,12 +370,25 @@ def main():
         #except FileNotFoundError:
         #    print(f'{pretrained_path} Not Found! The Model is same as SASRec')
 
-        early_stopping = EarlyStopping(args.checkpoint_path, patience=50, verbose=True)
+        early_stopping = EarlyStopping(args.checkpoint_path, patience=args.patience,
+                                       verbose=True,
+                                       smooth_window=args.val_smooth_window)
         for epoch in range(args.epochs):
             trainer.train(epoch)
-            # evaluate on MRR
-            scores, _, _ = trainer.valid(epoch, full_sort=True)
-            early_stopping(np.array(scores[-1:]), trainer.model)
+            # Evaluate on MRR. With --ema_decay set, validation and
+            # checkpointing both use the averaged weights: the live weights are
+            # swapped out, scored, checkpointed if best, then swapped back in
+            # so training continues from the raw (un-averaged) trajectory.
+            # Training itself is untouched either way.
+            use_ema = getattr(trainer, 'ema', None) is not None
+            if use_ema:
+                trainer.ema.copy_to(trainer.model)
+            try:
+                scores, _, _ = trainer.valid(epoch, full_sort=True)
+                early_stopping(np.array(scores[-1:]), trainer.model)
+            finally:
+                if use_ema:
+                    trainer.ema.restore(trainer.model)
             if early_stopping.early_stop:
                 print("Early stopping")
                 break
