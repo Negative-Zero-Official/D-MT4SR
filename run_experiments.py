@@ -42,6 +42,11 @@ CONFIGS = {
         'flags': [],
         'desc': 'Original MT4SR',
     },
+    'sasrec': {
+        'model_name': 'SASRecModel',
+        'flags': [],
+        'desc': 'Plain SASRec (no relation pathway)',
+    },
     'v1': {
         'model_name': 'DynamicRelationAwareSASRecModel',
         'flags': [],
@@ -142,7 +147,7 @@ CONFIGS = {
 }
 
 # Configs carrying the main positive claim -> run across all seeds.
-MAIN_CONFIGS = ['baseline', 'baseline_norm', 'v1', 'dynloss', 'v2',
+MAIN_CONFIGS = ['baseline', 'sasrec', 'baseline_norm', 'v1', 'dynloss', 'v2',
                 'v2_nonorm', 'v2_ent', 'v2_mask', 'v2_pair', 'v2_full',
                 'v2_dynloss']
 # Supporting / negative-result configs -> single seed is enough to report

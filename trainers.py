@@ -1101,6 +1101,31 @@ class RelationAwareSASRecModelTrainer(Trainer):
                 "rel_pair_contributed_loss": '{:.8f}'.format(effective_beta * rel_pair_loss_avg / len(rec_data_iter)),
             }
 
+            # --- Attention saturation diagnostics --------------------------
+            # Same fields the D-MT4SR trainer logs, so the two model families
+            # can be compared directly. attn_entropy near 0 (max is
+            # log(max_seq_length) ~ 4.6 for L=100) means attention is
+            # effectively one-hot and the ordinary query/key pathway is being
+            # drowned out by the relation scores. See
+            # modules._init_rel_score_norm for the measurements motivating this.
+            first_attn = self.model.item_encoder.layer[0].attention
+            if getattr(first_attn, 'last_attn_entropy', None) is not None:
+                post_fix["rel_score_absmax"] = '{:.2f}'.format(
+                    first_attn.last_rel_score_absmax)
+                post_fix["attn_entropy"] = '{:.4f}'.format(
+                    first_attn.last_attn_entropy)
+                post_fix["attn_entropy_max"] = '{:.4f}'.format(
+                    math.log(self.args.max_seq_length))
+                post_fix["relationship_weights"] = [
+                    round(v, 4) for v in
+                    first_attn.relationship_weights.detach().cpu().tolist()
+                ]
+                if getattr(first_attn, 'rel_score_norm', 'none') != 'none':
+                    post_fix["rel_score_gain_per_layer"] = [
+                        round(float(layer.attention.rel_score_gain.detach().cpu().item()), 4)
+                        for layer in self.model.item_encoder.layer
+                    ]
+
             if (epoch + 1) % self.args.log_freq == 0:
                 print(str(post_fix), flush=True)
 
