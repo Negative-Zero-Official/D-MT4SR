@@ -1,6 +1,8 @@
 *.pyc
 *.gz
 *.npy
+*.pdf
+*.tex
 dmt4sr*/
 relationsasrec_v6/
 paper_runs/
