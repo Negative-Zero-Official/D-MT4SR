@@ -144,12 +144,17 @@ CONFIGS = {
                   '--popularity_neg_sampling', '--popneg_mix=0.5'],
         'desc': 'v2 + 50/50 popularity/uniform negative sampling',
     },
+    'v1_norm': {
+        'model_name': 'DynamicRelationAwareSASRecModel',
+        'flags': ['--rel_score_norm=std'],
+        'desc': 'D-MT4SR v1 (free gate) + relation-score normalization',
+    },
 }
 
 # Configs carrying the main positive claim -> run across all seeds.
 MAIN_CONFIGS = ['baseline', 'sasrec', 'baseline_norm', 'v1', 'dynloss', 'v2',
                 'v2_nonorm', 'v2_ent', 'v2_mask', 'v2_pair', 'v2_full',
-                'v2_dynloss']
+                'v2_dynloss', 'v1_norm']
 # Supporting / negative-result configs -> single seed is enough to report
 # "we explored this and it did not improve over our base configuration".
 EXTRA_CONFIGS = ['popneg', 'timedecay', 'dynloss_popneg', 'timedecay_log',
@@ -196,6 +201,7 @@ SHARED_ARGS = [
 # smaller chunks mean more checkpoint recomputation and slower training.
 DATASET_ARGS = {
     # 'Appliances': ['--rel_loss_chunk_size=8192'],   # uncomment only if OOM
+    'Office_Products': ['--rel_loss_chunk_size=8192'],
 }
 
 
