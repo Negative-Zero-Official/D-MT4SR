@@ -202,13 +202,19 @@ SHARED_ARGS = [
 DATASET_ARGS = {
     # 'Appliances': ['--rel_loss_chunk_size=8192'],   # uncomment only if OOM
     # 'auto' resolves from the detected VRAM at run time: unchunked on an
-    # 80 GB A100, 32768 on a 40 GB card, 16384 on 24 GB, 8192 on 12-16 GB.
-    # On a 12 GB card that resolves to exactly the 8192 this line used to
-    # hardcode, so local runs are unchanged; the point is that the same
-    # command is now correct on the handoff machine too. Chunking is
-    # mathematically neutral -- same loss, same gradients, bounded memory --
-    # so this cannot move any metric.
+    # 'auto' now reads BOTH the card's VRAM and the dataset's catalog size:
+    #   Office_Products (item_size 136,077) -> 4096 on 12 GiB, 0 on 80 GiB
+    #   Video_Games     (item_size  47,285) -> 8192 on 12 GiB, 0 on 80 GiB
+    #   Appliances / All_Beauty             -> 0 (unchunked) everywhere
+    # Chunking is mathematically neutral -- same loss, same gradients, bounded
+    # memory -- so this cannot move any metric.
+    #
+    # Video_Games is pinned to 8192 explicitly rather than 'auto' because a
+    # trial was already launched with that value; on a 12 GiB card the two are
+    # the same number. Switch it to 'auto' if these runs ever move to a
+    # different card, where unchunked would be both valid and faster.
     'Office_Products': ['--rel_loss_chunk_size=auto'],
+    'Video_Games': ['--rel_loss_chunk_size=8192']
 }
 
 

@@ -823,59 +823,84 @@ def neg_sample_popularity(item_set, item_size, sampling_probs):
 # Automatic --rel_loss_chunk_size selection
 #
 # The inter-sequence relation loss materializes a (batch*seq*num_rel,
-# item_size) logits tensor. For Office_Products (item_size ~136k) at
-# batch=128, seq=100, num_rel=2 that is 25600 x 136077 float32 ~= 13.9 GB for
-# the forward pass alone, and roughly 2-3x that once the backward pass holds
-# its intermediates -- hence ~28-42 GB. --rel_loss_chunk_size bounds that peak
-# by computing the same sum in row-chunks under gradient checkpointing.
+# item_size) logits tensor and --rel_loss_chunk_size computes the same sum in
+# row-chunks under gradient checkpointing, bounding peak memory.
 #
 # Chunking is MATHEMATICALLY NEUTRAL: identical loss value, identical
 # gradients (see RelationAwareSASRecModelTrainer.relation_outside_seq_loss).
-# The only cost is recomputation time in the backward pass, so the right
-# policy is "use the largest chunk the card can hold, and none at all if it
-# can hold everything".
+# Its only cost is recomputation in the backward pass, so the policy is "use
+# the largest chunk that fits, and none at all if the whole tensor fits".
 #
-# Thresholds are on TOTAL device memory, keeping the shipped numbers explicit
-# rather than derived, so a run's chosen value can be reproduced from the log.
-# ---------------------------------------------------------------------------
-# MEASURED, not guessed. The chunk's peak is about THREE copies of the
-# (chunk, item_size) tensor live at once -- cross_entropy holds the logits, the
-# log_softmax it computes from them, and the incoming gradient -- so
+# MEASURED, not guessed: peak is about THREE copies of the (chunk, item_size)
+# tensor live at once -- cross_entropy holds the logits, the log_softmax it
+# computes from them, and the incoming gradient:
 #
 #     peak_bytes ~= 3 * chunk * item_size * 4
 #
-# For Office_Products (item_size 136,077) that is 1.56 MiB per row. Preflight
-# on an RTX 5070 measured 13.1 GiB peak at chunk 8192 against a predicted
-# 12.5 GiB + model, confirming the factor of 3.
+# Verified on an RTX 5070: Office_Products (item_size 136,077) at chunk 8192
+# predicted 12.5 GiB and measured 13.1 GiB; Video_Games (47,285) at chunk 4096
+# predicted 2.2 GiB and measured 2.6 GiB. The residual in both cases is the
+# model and its activations, which the caller sees separately.
 #
-# The policy is to keep that under ~70% of total VRAM, leaving room for the
-# model, activations and allocator fragmentation. An earlier version of this
-# table was one tier too aggressive at every level (8192 on a 12 GiB card needs
-# 12.5 GiB and silently spills into host memory on Windows, or OOMs on Linux).
-CHUNK_SIZE_BY_VRAM_GB = (
-    # (minimum total VRAM in GiB, chunk size; 0 = unchunked)
-    (70.0, 0),       # 80 GB A100/H100: unchunked needs ~39 GiB at batch 128 -- fits
-    (35.0, 16384),   # 40 GB A100 / 48 GB L40S  (~24.9 GiB)
-    (20.0, 8192),    # 24 GB 3090 / 4090 / A5000 (~12.5 GiB)
-    (0.0,  4096),    # 12-16 GB consumer cards, e.g. RTX 5070 (~6.2 GiB)
-)
+# EVERY number below is derived from item_size, num_rel and the device at run
+# time. Nothing here is specific to a dataset -- an earlier version of this
+# file carried a fixed VRAM->chunk table derived from Office_Products, which
+# was wrong in both directions for other catalogs (it would have chunked
+# Appliances, which needs no chunking, and under-chunked Video_Games).
+# ---------------------------------------------------------------------------
 
-# Bytes of peak GPU memory per chunk row, per item in the catalog. Used to
-# predict the peak before allocating it, so preflight can say whether the
-# chosen chunk size actually fits rather than finding out by OOMing.
+# Bytes of peak GPU memory per chunk row, per item in the catalog.
 CHUNK_PEAK_BYTES_PER_ROW_PER_ITEM = 3 * 4
 
+# Fraction of total device memory the relation loss may occupy, leaving room
+# for the model, its activations and allocator fragmentation.
+CHUNK_HEADROOM_FRAC = 0.70
 
-def predicted_chunk_peak_gib(chunk_size, item_size, batch_size=128,
-                             max_seq_length=100, num_rel=2):
+# Assumed budget for a CPU-only run, where there is no VRAM to read. Host RAM
+# is the constraint instead and we cannot query a meaningful limit portably,
+# so this is deliberately conservative.
+CPU_RAM_BUDGET_GB = 8.0
+
+# Smallest chunk we will ever choose. Below this the per-chunk launch overhead
+# starts to dominate and something else is wrong with the configuration.
+MIN_CHUNK_SIZE = 512
+
+
+def relation_loss_rows(batch_size, max_seq_length, num_rel):
+    """Rows in the (batch*seq*num_rel, item_size) logits tensor."""
+    return batch_size * max_seq_length * num_rel
+
+
+def predicted_chunk_peak_gib(chunk_size, item_size, batch_size,
+                             max_seq_length, num_rel):
     """Predicted peak GiB of the inter-sequence relation loss.
 
     chunk_size 0 (unchunked) is scored at the full row count, which is what
     that setting actually materializes.
     """
-    rows = batch_size * max_seq_length * num_rel
+    rows = relation_loss_rows(batch_size, max_seq_length, num_rel)
     effective = rows if not chunk_size or chunk_size <= 0 else min(chunk_size, rows)
     return (effective * item_size * CHUNK_PEAK_BYTES_PER_ROW_PER_ITEM) / (1024 ** 3)
+
+
+def chunk_size_for(budget_gb, item_size, batch_size, max_seq_length, num_rel,
+                   headroom_frac=CHUNK_HEADROOM_FRAC):
+    """Largest safe chunk size for this device budget and this catalog.
+
+    Returns 0 (unchunked) whenever the whole tensor already fits, since
+    chunking would then cost recomputation and buy nothing.
+    """
+    rows = relation_loss_rows(batch_size, max_seq_length, num_rel)
+    budget = headroom_frac * budget_gb * (1024 ** 3)
+    per_row = item_size * CHUNK_PEAK_BYTES_PER_ROW_PER_ITEM
+    if rows * per_row <= budget:
+        return 0
+    affordable = int(budget // per_row)
+    chunk = 1
+    while chunk * 2 <= affordable:
+        chunk *= 2
+    return max(chunk, MIN_CHUNK_SIZE)
+
 
 # Sentinel stored in args.rel_loss_chunk_size by the '--rel_loss_chunk_size=auto'
 # argparse type below, before the device is known. Resolved to a real int by
@@ -917,41 +942,49 @@ def detect_total_vram_gb(device_index=0):
     return props.total_memory / (1024 ** 3)
 
 
-def chunk_size_for_vram(vram_gb):
-    """Map total VRAM (GiB) to a chunk size using CHUNK_SIZE_BY_VRAM_GB."""
-    for threshold, chunk in CHUNK_SIZE_BY_VRAM_GB:
-        if vram_gb >= threshold:
-            return chunk
-    return CHUNK_SIZE_BY_VRAM_GB[-1][1]
-
-
-def resolve_rel_loss_chunk_size(args, verbose=True):
+def resolve_rel_loss_chunk_size(args, num_rel, verbose=True):
     """Replace the 'auto' sentinel in args with a concrete chunk size.
 
     No-op for an explicitly given value, so a run that passes a number gets
-    exactly that number and nothing about existing runs changes. Returns the
-    resolved int.
+    exactly that number and nothing about existing runs changes.
+
+    num_rel must be passed by the caller (len(relationships_ind_map)) rather
+    than assumed: it multiplies the row count directly, so guessing it wrong
+    scales the memory estimate by the same factor.
+
+    Returns the resolved int.
     """
     requested = getattr(args, 'rel_loss_chunk_size', 0)
     if requested != REL_LOSS_CHUNK_AUTO:
         return requested
 
+    item_size = getattr(args, 'item_size', None)
+    if not item_size:
+        raise RuntimeError(
+            "--rel_loss_chunk_size=auto was resolved before args.item_size was "
+            "set. The catalog size determines the chunk, so resolve it after "
+            "the dataset is loaded (see main.py).")
+
+    batch_size = getattr(args, 'batch_size', 128)
+    max_seq_length = getattr(args, 'max_seq_length', 100)
+
     vram_gb = detect_total_vram_gb()
     if vram_gb is None:
-        # CPU-only run: there is no VRAM to bound, and chunking would only add
-        # recomputation cost. Host RAM is the constraint instead, so pick the
-        # smallest shipped chunk rather than unchunked.
-        chunk = CHUNK_SIZE_BY_VRAM_GB[-1][1]
-        if verbose:
-            print(f"[rel_loss_chunk_size=auto] no CUDA device visible; "
-                  f"using {chunk} to bound host RAM.", flush=True)
+        budget_gb, where = CPU_RAM_BUDGET_GB, 'of assumed host RAM'
+        device_desc = 'no CUDA device'
     else:
-        chunk = chunk_size_for_vram(vram_gb)
-        name = torch.cuda.get_device_name(0)
-        how = 'unchunked (the full logits tensor fits)' if chunk == 0 else f'chunk size {chunk}'
-        if verbose:
-            print(f"[rel_loss_chunk_size=auto] detected {name} with "
-                  f"{vram_gb:.1f} GiB VRAM -> {how}.", flush=True)
+        budget_gb, where = vram_gb, 'VRAM'
+        device_desc = torch.cuda.get_device_name(0)
+
+    chunk = chunk_size_for(budget_gb, item_size, batch_size, max_seq_length, num_rel)
+    if verbose:
+        peak = predicted_chunk_peak_gib(chunk, item_size, batch_size,
+                                        max_seq_length, num_rel)
+        how = ('unchunked (the full logits tensor fits)' if chunk == 0
+               else f'chunk size {chunk}')
+        print(f"[rel_loss_chunk_size=auto] {device_desc}, {budget_gb:.1f} GiB {where}, "
+              f"catalog {item_size:,} x {num_rel} relations -> {how} "
+              f"(predicted peak {peak:.1f} GiB).", flush=True)
 
     args.rel_loss_chunk_size = chunk
     return chunk

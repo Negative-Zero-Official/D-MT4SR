@@ -11,5 +11,5 @@ relationsasrec_v6/
 paper_runs/
 quick_*/
 appliances_main/
-office_trial*/
+*_test/
 handoff/

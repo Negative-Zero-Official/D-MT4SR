@@ -287,8 +287,8 @@ def main():
 
     try:
         from utils import (get_user_seqs_MoHRdata, set_seed,
-                           detect_total_vram_gb, chunk_size_for_vram,
-                           predicted_chunk_peak_gib)
+                           detect_total_vram_gb, chunk_size_for,
+                           predicted_chunk_peak_gib, CPU_RAM_BUDGET_GB)
         t0 = time.time()
         (user_seq, max_item, valid_rating_matrix, test_rating_matrix, num_users,
          user_seq_mask_mat_rel, relationships_ind_map, Item,
@@ -318,14 +318,19 @@ def main():
     section('4. RELATION-LOSS CHUNK SIZE')
 
     item_size = max_item + 2
+    num_rel = len(relationships_ind_map)
     if vram_gb is None:
-        auto_chunk = chunk_size_for_vram(0.0)
-        print(f'  No GPU detected; showing the {auto_chunk} fallback.')
+        auto_chunk = chunk_size_for(CPU_RAM_BUDGET_GB, item_size,
+                                    args_cli.batch_size, 100, num_rel)
+        print(f'  No GPU detected; sizing against an assumed '
+              f'{CPU_RAM_BUDGET_GB:.0f} GiB of host RAM -> {auto_chunk}.')
     else:
-        auto_chunk = chunk_size_for_vram(vram_gb)
+        # Must match utils.resolve_rel_loss_chunk_size() exactly, or preflight
+        # advertises one chunk size and the run uses another.
+        auto_chunk = chunk_size_for(vram_gb, item_size,
+                                    args_cli.batch_size, 100, num_rel)
 
     # The tensor the whole memory story is about.
-    num_rel = len(relationships_ind_map)
     logits_gb = (args_cli.batch_size * 100 * num_rel * item_size * 4) / (1024 ** 3)
     item('Full logits tensor',
          f'{args_cli.batch_size} x 100 x {num_rel} x {item_size:,} float32 '
@@ -642,6 +647,15 @@ def main():
             item('Usable (85% of VRAM)', f'{0.85 * vram_gb:.1f} GiB')
             item('Unrounded capacity', f'{int(raw_max)}')
             item('Largest batch that fits', f'{fitted_batch} (rounded to a multiple of 64)')
+            fit_steps = -(-num_users // fitted_batch)
+            item('...which would give', f'{fit_steps:,} optimizer steps per epoch '
+                                        f'(vs {steps_per_epoch:,} at batch {args_cli.batch_size})')
+            if fit_steps < 100:
+                print()
+                print(f'  That is only {fit_steps} weight updates per epoch. Memory is not the')
+                print('  binding constraint at this catalog size -- the chunked loss keeps peak')
+                print('  memory flat as the batch grows -- so this number says what FITS, not')
+                print('  what is sensible. Treat it as an upper bound, not a suggestion.')
             max_batch = fitted_batch
         print()
         print('  READ THIS BEFORE CHANGING THE BATCH SIZE')

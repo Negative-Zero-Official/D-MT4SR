@@ -219,14 +219,6 @@ def main():
     os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu_id
     args.cuda_condition = torch.cuda.is_available() and not args.no_cuda
 
-    # '--rel_loss_chunk_size=auto' is resolved to a concrete integer here,
-    # before args is printed or written to the log, so the log line records the
-    # value that was actually used rather than the sentinel. An explicitly
-    # given value passes through untouched. Chunking is mathematically neutral
-    # (same loss, same gradients), so this only affects peak memory and speed,
-    # never the numbers a run produces.
-    resolve_rel_loss_chunk_size(args)
-
     args.data_file = args.data_dir + args.data_name + '.txt'
     #item2attribute_file = args.data_dir + args.data_name + '_item2attributes.json'
 
@@ -247,6 +239,15 @@ def main():
     # SASRecDataset/RelationAwareSASRecDataset code paths, which never look at
     # this flag -- are completely unaffected either way.
     args.has_real_timestamps = user_seq_times is not None
+
+    # '--rel_loss_chunk_size=auto' is resolved to a concrete integer here --
+    # after item_size is known, so the choice accounts for the catalog size and
+    # not just the card, and before args is printed or written to the log, so
+    # the log records the value actually used rather than the sentinel. An
+    # explicitly given value passes through untouched. Chunking is
+    # mathematically neutral (same loss, same gradients), so this affects only
+    # peak memory and speed, never the numbers a run produces.
+    resolve_rel_loss_chunk_size(args, num_rel=len(relationships_ind_map))
 
     # save model args
     # NOTE: seed and outseq_rel_loss_weight are part of the name so that repeated
