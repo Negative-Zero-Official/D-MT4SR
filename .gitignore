@@ -3,9 +3,13 @@
 *.npy
 *.pdf
 *.tex
+*.zip
+README_HANDOFF.md
+RUN_COMMANDS.txt
 dmt4sr*/
 relationsasrec_v6/
 paper_runs/
 quick_*/
 appliances_main/
-office_trial/
+office_trial*/
+handoff/

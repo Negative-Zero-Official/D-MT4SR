@@ -201,7 +201,14 @@ SHARED_ARGS = [
 # smaller chunks mean more checkpoint recomputation and slower training.
 DATASET_ARGS = {
     # 'Appliances': ['--rel_loss_chunk_size=8192'],   # uncomment only if OOM
-    'Office_Products': ['--rel_loss_chunk_size=8192'],
+    # 'auto' resolves from the detected VRAM at run time: unchunked on an
+    # 80 GB A100, 32768 on a 40 GB card, 16384 on 24 GB, 8192 on 12-16 GB.
+    # On a 12 GB card that resolves to exactly the 8192 this line used to
+    # hardcode, so local runs are unchanged; the point is that the same
+    # command is now correct on the handoff machine too. Chunking is
+    # mathematically neutral -- same loss, same gradients, bounded memory --
+    # so this cannot move any metric.
+    'Office_Products': ['--rel_loss_chunk_size=auto'],
 }
 
 

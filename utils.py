@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 
+import argparse
 import numpy as np
 import math
 import random
@@ -816,3 +817,141 @@ def neg_sample_popularity(item_set, item_size, sampling_probs):
         if tries > 50:
             return neg_sample(item_set, item_size)
     return item
+
+
+# ---------------------------------------------------------------------------
+# Automatic --rel_loss_chunk_size selection
+#
+# The inter-sequence relation loss materializes a (batch*seq*num_rel,
+# item_size) logits tensor. For Office_Products (item_size ~136k) at
+# batch=128, seq=100, num_rel=2 that is 25600 x 136077 float32 ~= 13.9 GB for
+# the forward pass alone, and roughly 2-3x that once the backward pass holds
+# its intermediates -- hence ~28-42 GB. --rel_loss_chunk_size bounds that peak
+# by computing the same sum in row-chunks under gradient checkpointing.
+#
+# Chunking is MATHEMATICALLY NEUTRAL: identical loss value, identical
+# gradients (see RelationAwareSASRecModelTrainer.relation_outside_seq_loss).
+# The only cost is recomputation time in the backward pass, so the right
+# policy is "use the largest chunk the card can hold, and none at all if it
+# can hold everything".
+#
+# Thresholds are on TOTAL device memory, keeping the shipped numbers explicit
+# rather than derived, so a run's chosen value can be reproduced from the log.
+# ---------------------------------------------------------------------------
+# MEASURED, not guessed. The chunk's peak is about THREE copies of the
+# (chunk, item_size) tensor live at once -- cross_entropy holds the logits, the
+# log_softmax it computes from them, and the incoming gradient -- so
+#
+#     peak_bytes ~= 3 * chunk * item_size * 4
+#
+# For Office_Products (item_size 136,077) that is 1.56 MiB per row. Preflight
+# on an RTX 5070 measured 13.1 GiB peak at chunk 8192 against a predicted
+# 12.5 GiB + model, confirming the factor of 3.
+#
+# The policy is to keep that under ~70% of total VRAM, leaving room for the
+# model, activations and allocator fragmentation. An earlier version of this
+# table was one tier too aggressive at every level (8192 on a 12 GiB card needs
+# 12.5 GiB and silently spills into host memory on Windows, or OOMs on Linux).
+CHUNK_SIZE_BY_VRAM_GB = (
+    # (minimum total VRAM in GiB, chunk size; 0 = unchunked)
+    (70.0, 0),       # 80 GB A100/H100: unchunked needs ~39 GiB at batch 128 -- fits
+    (35.0, 16384),   # 40 GB A100 / 48 GB L40S  (~24.9 GiB)
+    (20.0, 8192),    # 24 GB 3090 / 4090 / A5000 (~12.5 GiB)
+    (0.0,  4096),    # 12-16 GB consumer cards, e.g. RTX 5070 (~6.2 GiB)
+)
+
+# Bytes of peak GPU memory per chunk row, per item in the catalog. Used to
+# predict the peak before allocating it, so preflight can say whether the
+# chosen chunk size actually fits rather than finding out by OOMing.
+CHUNK_PEAK_BYTES_PER_ROW_PER_ITEM = 3 * 4
+
+
+def predicted_chunk_peak_gib(chunk_size, item_size, batch_size=128,
+                             max_seq_length=100, num_rel=2):
+    """Predicted peak GiB of the inter-sequence relation loss.
+
+    chunk_size 0 (unchunked) is scored at the full row count, which is what
+    that setting actually materializes.
+    """
+    rows = batch_size * max_seq_length * num_rel
+    effective = rows if not chunk_size or chunk_size <= 0 else min(chunk_size, rows)
+    return (effective * item_size * CHUNK_PEAK_BYTES_PER_ROW_PER_ITEM) / (1024 ** 3)
+
+# Sentinel stored in args.rel_loss_chunk_size by the '--rel_loss_chunk_size=auto'
+# argparse type below, before the device is known. Resolved to a real int by
+# resolve_rel_loss_chunk_size(). Negative so it can never be mistaken for a
+# valid chunk size, and so the trainer's "<= 0 means unchunked" guard would
+# fail safe rather than silently running unchunked if resolution were skipped.
+REL_LOSS_CHUNK_AUTO = -1
+
+
+def rel_loss_chunk_size_arg(value):
+    """argparse type for --rel_loss_chunk_size: an int, or the string 'auto'.
+
+    Returning an int in both cases keeps `str(args)` (which main.py writes as
+    the first line of every log file) showing a plain integer, so logs written
+    before and after this option existed stay directly comparable.
+    """
+    if isinstance(value, str) and value.strip().lower() == 'auto':
+        return REL_LOSS_CHUNK_AUTO
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError(
+            f"--rel_loss_chunk_size expects an integer or 'auto', got {value!r}")
+    if parsed < 0:
+        raise argparse.ArgumentTypeError(
+            "--rel_loss_chunk_size must be >= 0 (0 disables chunking), "
+            f"got {parsed}")
+    return parsed
+
+
+def detect_total_vram_gb(device_index=0):
+    """Total memory of the selected CUDA device in GiB, or None if no CUDA."""
+    if not torch.cuda.is_available():
+        return None
+    try:
+        props = torch.cuda.get_device_properties(device_index)
+    except (AssertionError, RuntimeError):
+        return None
+    return props.total_memory / (1024 ** 3)
+
+
+def chunk_size_for_vram(vram_gb):
+    """Map total VRAM (GiB) to a chunk size using CHUNK_SIZE_BY_VRAM_GB."""
+    for threshold, chunk in CHUNK_SIZE_BY_VRAM_GB:
+        if vram_gb >= threshold:
+            return chunk
+    return CHUNK_SIZE_BY_VRAM_GB[-1][1]
+
+
+def resolve_rel_loss_chunk_size(args, verbose=True):
+    """Replace the 'auto' sentinel in args with a concrete chunk size.
+
+    No-op for an explicitly given value, so a run that passes a number gets
+    exactly that number and nothing about existing runs changes. Returns the
+    resolved int.
+    """
+    requested = getattr(args, 'rel_loss_chunk_size', 0)
+    if requested != REL_LOSS_CHUNK_AUTO:
+        return requested
+
+    vram_gb = detect_total_vram_gb()
+    if vram_gb is None:
+        # CPU-only run: there is no VRAM to bound, and chunking would only add
+        # recomputation cost. Host RAM is the constraint instead, so pick the
+        # smallest shipped chunk rather than unchunked.
+        chunk = CHUNK_SIZE_BY_VRAM_GB[-1][1]
+        if verbose:
+            print(f"[rel_loss_chunk_size=auto] no CUDA device visible; "
+                  f"using {chunk} to bound host RAM.", flush=True)
+    else:
+        chunk = chunk_size_for_vram(vram_gb)
+        name = torch.cuda.get_device_name(0)
+        how = 'unchunked (the full logits tensor fits)' if chunk == 0 else f'chunk size {chunk}'
+        if verbose:
+            print(f"[rel_loss_chunk_size=auto] detected {name} with "
+                  f"{vram_gb:.1f} GiB VRAM -> {how}.", flush=True)
+
+    args.rel_loss_chunk_size = chunk
+    return chunk

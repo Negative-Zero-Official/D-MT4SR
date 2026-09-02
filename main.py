@@ -14,7 +14,8 @@ from datasets import SASRecDataset, RelationAwareSASRecDataset, DynamicRelationA
 from trainers import FinetuneTrainer, DistSAModelTrainer, RelationAwareSASRecModelTrainer, DynamicRelationAwareSASRecModelTrainer
 from seqmodels import SASRecModel, DistSAModel, DistMeanSAModel, RelationAwareSASRecModel, DynamicRelationAwareSASRecModel
 from utils import EarlyStopping, get_user_seqs, get_item2attribute_json, check_path, set_seed, get_user_seqs_MoHRdata, \
-        compute_item_popularity, build_popularity_sampling_probs
+        compute_item_popularity, build_popularity_sampling_probs, \
+        rel_loss_chunk_size_arg, resolve_rel_loss_chunk_size
 
 
 # D-MT4SR v2 options are appended to the run name ONLY when they differ from
@@ -183,14 +184,18 @@ def main():
                              "distribution. Available for the MT4SR baseline too, so it can be "
                              "run as a control. 'none' = original behavior.")
 
-    parser.add_argument('--rel_loss_chunk_size', default=0, type=int,
+    parser.add_argument('--rel_loss_chunk_size', default=0, type=rel_loss_chunk_size_arg,
                         help="Compute the inter-sequence relation loss in row-chunks of this "
                              "size under gradient checkpointing, bounding peak GPU memory. "
                              "Mathematically identical to the unchunked loss (same value and "
                              "gradients), just slower. 0 = disabled (original behavior). "
                              "Needed for large-catalog datasets such as Office_Products, where "
                              "the full (batch*seq*num_rel, item_size) logits tensor can exceed "
-                             "GPU memory. Try 2048 or 1024 if you hit CUDA OOM.")
+                             "GPU memory. Try 2048 or 1024 if you hit CUDA OOM. "
+                             "Pass 'auto' to pick a value from the detected VRAM "
+                             "(>=70 GiB unchunked, 35-70 -> 32768, 20-35 -> 16384, else 8192); "
+                             "the chosen value is printed and appears in the log's args line, "
+                             "so an auto run stays as reproducible as an explicit one.")
 
     # train args
     parser.add_argument("--lr", type=float, default=0.001, help="learning rate of adam")
@@ -213,6 +218,14 @@ def main():
 
     os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu_id
     args.cuda_condition = torch.cuda.is_available() and not args.no_cuda
+
+    # '--rel_loss_chunk_size=auto' is resolved to a concrete integer here,
+    # before args is printed or written to the log, so the log line records the
+    # value that was actually used rather than the sentinel. An explicitly
+    # given value passes through untouched. Chunking is mathematically neutral
+    # (same loss, same gradients), so this only affects peak memory and speed,
+    # never the numbers a run produces.
+    resolve_rel_loss_chunk_size(args)
 
     args.data_file = args.data_dir + args.data_name + '.txt'
     #item2attribute_file = args.data_dir + args.data_name + '_item2attributes.json'
