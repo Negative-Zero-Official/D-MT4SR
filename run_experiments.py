@@ -214,7 +214,8 @@ DATASET_ARGS = {
     # the same number. Switch it to 'auto' if these runs ever move to a
     # different card, where unchunked would be both valid and faster.
     'Office_Products': ['--rel_loss_chunk_size=auto'],
-    'Video_Games': ['--rel_loss_chunk_size=auto']
+    'Video_Games': ['--rel_loss_chunk_size=auto'],
+    "Industrial_and_Scientific": ['--rel_loss_chunk_size=auto'],
 }
 
 
