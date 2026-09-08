@@ -214,8 +214,78 @@ DATASET_ARGS = {
     # the same number. Switch it to 'auto' if these runs ever move to a
     # different card, where unchunked would be both valid and faster.
     'Office_Products': ['--rel_loss_chunk_size=auto'],
-    'Video_Games': ['--rel_loss_chunk_size=8192']
+    'Video_Games': ['--rel_loss_chunk_size=auto']
 }
+
+
+def print_device_banner():
+    """Report, once, exactly what hardware the runs will use.
+
+    torch is imported lazily so that --help and --dry-run still work in an
+    environment without it. Every child run also records its own
+    cuda_condition in the first line of its log, but that is buried in the
+    Namespace dump; this makes it the first thing on screen.
+    """
+    print('=' * 70)
+    print('DEVICE')
+    print('=' * 70)
+    try:
+        import torch
+    except ImportError as exc:
+        print(f'  torch is NOT importable ({exc}).')
+        print('  The runs below will fail immediately. Install PyTorch first.')
+        print('=' * 70 + '\n')
+        return
+
+    visible = os.environ.get('CUDA_VISIBLE_DEVICES')
+    print(f'  PyTorch                 : {torch.__version__}')
+    print(f'  Built against CUDA      : {torch.version.cuda or "CPU-only build"}')
+    print(f'  CUDA_VISIBLE_DEVICES    : {visible if visible is not None else "(unset -- all GPUs visible)"}')
+
+    if not torch.cuda.is_available():
+        print('  torch.cuda.is_available : False')
+        print()
+        print('  *** WARNING: NO GPU. These runs will execute on the CPU and will')
+        print('  *** take days rather than hours. Check "nvidia-smi", and check')
+        print('  *** that the installed PyTorch is a CUDA build (the line above')
+        print('  *** must not say CPU-only). Ctrl-C now unless this is deliberate.')
+        print('=' * 70 + '\n')
+        return
+
+    idx = torch.cuda.current_device()
+    props = torch.cuda.get_device_properties(idx)
+    print(f'  torch.cuda.is_available : True')
+    print(f'  Visible GPU count       : {torch.cuda.device_count()}')
+    print(f'  Training will run on    : cuda:{idx}  {props.name}')
+    print(f'  Device memory           : {props.total_memory / (1024 ** 3):.1f} GiB'
+          f'   compute capability sm_{props.major}{props.minor}')
+    if torch.cuda.device_count() > 1:
+        for i in range(torch.cuda.device_count()):
+            p_i = torch.cuda.get_device_properties(i)
+            mark = ' <- in use' if i == idx else ''
+            print(f'    cuda:{i}  {p_i.name}  '
+                  f'{p_i.total_memory / (1024 ** 3):.1f} GiB{mark}')
+        print('    (set CUDA_VISIBLE_DEVICES=<n> to pin a different one)')
+
+    # Prove the device is actually usable rather than merely present: a
+    # driver/toolkit mismatch reports is_available() True and then fails on
+    # the first real allocation.
+    try:
+        t = torch.zeros(1024, 1024, device=f'cuda:{idx}')
+        t = (t + 1).sum().item()
+        alloc = torch.cuda.memory_allocated(idx) / (1024 ** 2)
+        print(f'  Allocation test         : OK ({alloc:.0f} MiB allocated during test)')
+        del t
+        torch.cuda.empty_cache()
+    except Exception as exc:
+        print(f'  Allocation test         : FAILED -- {type(exc).__name__}: {exc}')
+        print('  *** The GPU is visible but unusable. The runs will fail or fall back.')
+    print()
+    print('  NOTE: low GPU% in Windows Task Manager is normal here. Task Manager')
+    print('  shows the 3D engine by default; CUDA work appears under the "Cuda"')
+    print('  or "Compute" engine. Per-epoch validation is also host-side numpy,')
+    print('  so high CPU with idle GPU during evaluation is expected, not a bug.')
+    print('=' * 70 + '\n')
 
 
 def build_plan(datasets, configs, main_seeds, extra_seed):
@@ -387,6 +457,8 @@ def main():
     if args.aggregate_only:
         run_aggregation(output_dir, args.metrics, paired=args.paired)
         return
+
+    print_device_banner()
 
     os.makedirs(output_dir, exist_ok=True)
     os.makedirs(console_dir, exist_ok=True)
