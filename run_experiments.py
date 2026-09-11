@@ -10,7 +10,14 @@ Typical use:
     python run_experiments.py                    # run everything
     python run_experiments.py --datasets All_Beauty
     python run_experiments.py --configs baseline v1 dynloss
+    python run_experiments.py --order config     # old config-major ordering
     python run_experiments.py --aggregate-only   # just re-print the tables
+
+By default runs are ordered SEED-MAJOR: every config at seed 1, then every
+config at seed 7, and so on. Each completed block is therefore a full
+paired-by-seed comparison, so the console log is readable as it goes and an
+interrupted suite still leaves comparable numbers. Use --order config for the
+old behaviour (all seeds of one config before moving to the next).
 
 Each run's console output goes to <output_dir>/console/<tag>.log, and the
 run status ledger lives at <output_dir>/run_status.json. The model's own
@@ -289,22 +296,61 @@ def print_device_banner():
     print('=' * 70 + '\n')
 
 
-def build_plan(datasets, configs, main_seeds, extra_seed):
-    """Returns a list of run descriptors."""
+def build_plan(datasets, configs, main_seeds, extra_seed, order='seed'):
+    """Returns a list of run descriptors.
+
+    order='seed' (default) INTERLEAVES the configs: every main config at seed
+    1, then every main config at seed 7, and so on. The analysis in
+    aggregate_results.py is paired by seed, and a paired test only uses the
+    seeds a config and the baseline share -- so a completed seed block is a
+    complete comparison, whereas config-major ordering spends a long stretch
+    holding three baseline seeds and zero seeds of the config you care about.
+    Interleaving also surfaces every config's first run early, which is when
+    an OOM or a bad flag is cheap to find, and it stops per-run wall-clock
+    times from being confounded with time of day / thermal state.
+
+    order='config' restores the original grouping (all seeds of one config
+    before the next), which is what you want when running a single config to
+    completion in isolation.
+
+    Single-seed supporting configs (anything outside MAIN_CONFIGS) always run
+    on extra_seed, so under seed-major ordering they are appended after all
+    seed blocks rather than being lumped into whichever block matches.
+
+    Ordering has no effect on any result: each run's seed is passed to main.py
+    explicitly, and the run ledger is keyed by tag, so resuming works the same
+    either way.
+    """
+    for cfg_name in configs:
+        if cfg_name not in CONFIGS:
+            raise SystemExit(f"Unknown config '{cfg_name}'. "
+                             f"Known: {', '.join(CONFIGS)}")
+
+    def make(dataset, cfg_name, seed):
+        return {
+            'tag': f'{dataset}__{cfg_name}__seed{seed}',
+            'dataset': dataset,
+            'config': cfg_name,
+            'seed': seed,
+        }
+
     plan = []
     for dataset in datasets:
-        for cfg_name in configs:
-            if cfg_name not in CONFIGS:
-                raise SystemExit(f"Unknown config '{cfg_name}'. "
-                                 f"Known: {', '.join(CONFIGS)}")
-            seeds = main_seeds if cfg_name in MAIN_CONFIGS else [extra_seed]
-            for seed in seeds:
-                plan.append({
-                    'tag': f'{dataset}__{cfg_name}__seed{seed}',
-                    'dataset': dataset,
-                    'config': cfg_name,
-                    'seed': seed,
-                })
+        if order == 'config':
+            # Original behaviour, including the original interleaving of main
+            # and supporting configs in whatever order the user listed them.
+            for cfg_name in configs:
+                seeds = main_seeds if cfg_name in MAIN_CONFIGS else [extra_seed]
+                for seed in seeds:
+                    plan.append(make(dataset, cfg_name, seed))
+        else:
+            main = [c for c in configs if c in MAIN_CONFIGS]
+            extra = [c for c in configs if c not in MAIN_CONFIGS]
+            for seed in main_seeds:
+                for cfg_name in main:
+                    plan.append(make(dataset, cfg_name, seed))
+            for cfg_name in extra:
+                plan.append(make(dataset, cfg_name, extra_seed))
     return plan
 
 
@@ -399,6 +445,13 @@ def main():
                     help='seeds for the main configs (default: 1 7 42)')
     ap.add_argument('--extra-seed', type=int, default=42,
                     help='single seed used for supporting/negative configs')
+    ap.add_argument('--order', choices=['seed', 'config'], default='seed',
+                    help="run order. 'seed' (default) interleaves the configs "
+                         'so each seed block is a complete paired comparison '
+                         'you can read while the suite is still running; '
+                         "'config' runs all seeds of one config before the "
+                         'next (the original behaviour). Affects order only, '
+                         'never results.')
     ap.add_argument('--output-dir', default='paper_runs/',
                     help='where main.py writes logs and checkpoints')
     ap.add_argument('--metrics', nargs='+', default=['MRR', 'NDCG@10', 'HIT@10'],
@@ -464,7 +517,8 @@ def main():
     os.makedirs(output_dir, exist_ok=True)
     os.makedirs(console_dir, exist_ok=True)
 
-    plan = build_plan(args.datasets, args.configs, args.seeds, args.extra_seed)
+    plan = build_plan(args.datasets, args.configs, args.seeds,
+                      args.extra_seed, order=args.order)
     status = load_status(status_path)
 
     def needs_run(r):
@@ -494,6 +548,12 @@ def main():
     extras = [c for c in args.configs if c in EXTRA_CONFIGS]
     if extras:
         print(f'Supporting configs (seed {args.extra_seed} only): {", ".join(extras)}')
+    if args.order == 'seed':
+        print('Run order: seed-major -- configs are interleaved, so each seed '
+              'block\n           is a complete paired comparison '
+              '(--order config for the old order).')
+    else:
+        print('Run order: config-major -- all seeds of one config before the next.')
     print(f'Output dir: {output_dir}\n')
 
     if stale:
@@ -524,10 +584,28 @@ def main():
 
     suite_start = time.time()
     failures = []
+    block = None
 
     for i, r in enumerate(todo, 1):
         cmd = build_command(r, output_dir, args.passthrough)
         console_path = os.path.join(console_dir, r['tag'] + '.log')
+
+        # Under seed-major ordering, mark where one seed block ends and the
+        # next begins so the console log is skimmable: everything between two
+        # banners is the same seed across configs, i.e. directly comparable.
+        if args.order == 'seed':
+            is_extra = r['config'] not in MAIN_CONFIGS
+            this_block = (r['dataset'], 'extra' if is_extra else r['seed'])
+            if this_block != block:
+                block = this_block
+                print('\n' + '=' * 70)
+                if is_extra:
+                    print(f"BLOCK  {r['dataset']}  |  supporting configs "
+                          f"(seed {r['seed']} only)")
+                else:
+                    print(f"BLOCK  {r['dataset']}  |  seed {r['seed']}  "
+                          f"-- all main configs, directly comparable")
+                print('=' * 70)
 
         print('-' * 70)
         print(f"[{i}/{len(todo)}] {r['tag']}")
