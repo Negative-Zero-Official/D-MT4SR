@@ -419,4 +419,6 @@ def main():
     with open(args.log_file, 'a') as f:
         f.write(args_str + '\n')
         f.write(result_info + '\n')
-main()
+
+if __name__ == '__main__':
+    main()

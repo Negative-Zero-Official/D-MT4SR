@@ -4,6 +4,7 @@
 *.pdf
 *.tex
 *.zip
+.vscode
 README_HANDOFF.md
 RUN_COMMANDS.txt
 quick_*/
@@ -11,3 +12,4 @@ quick_*/
 *_test/
 handoff/
 Preparation_of_Papers_for_IEEE_ACCESS__3_/
+BDCC/
